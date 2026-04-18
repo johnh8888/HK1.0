@@ -211,7 +211,6 @@ def _parse_marksix6_payload(payload: dict) -> List[DrawRecord]:
 
 
 def fetch_marksix6_records(retries: int = 3, timeout: int = 30) -> List[DrawRecord]:
-    """升级版：尝试获取更多2026年历史数据"""
     req = Request(
         API_URL,
         headers={
@@ -570,7 +569,6 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
     mined_cfg = _default_mined_config()
     strategy_weights = get_strategy_weights(conn, window=6)
 
-    # 检查ML是否需要重新训练（每5期）
     last_train_issue = get_model_state(conn, LAST_ML_TRAIN_KEY)
     if last_train_issue is None or (target_issue > last_train_issue and (int(target_issue.split('/')[1]) - int(last_train_issue.split('/')[1]) >= 5)):
         train_ml_model(conn)
@@ -650,41 +648,44 @@ def review_latest(conn: sqlite3.Connection) -> int:
     return 0
 
 
-# ==================== 用户要求替换的三个函数 ====================
+# ==================== 智能版 get_top_strategies（用户提供） ====================
 def get_top_strategies(conn: sqlite3.Connection, top_n: int = 3, window: int = 6) -> List[str]:
-    """降低门槛 + 只打印一次提示"""
-    if hasattr(get_top_strategies, "has_printed"):
-        rows = conn.execute("""
-            SELECT p.strategy, AVG(p.hit_count) as avg_hit, AVG(p.hit_rate) as avg_rate, COUNT(*) as count
-            FROM prediction_runs p
-            WHERE p.status = 'REVIEWED'
-            GROUP BY p.strategy
-            ORDER BY avg_rate DESC, avg_hit DESC
-            LIMIT ?
-        """, (top_n,)).fetchall()
+    """智能版：有历史用动态，无历史用高质量默认组合"""
+    rows = conn.execute("""
+        SELECT 
+            p.strategy,
+            AVG(p.hit_count) as avg_hit,
+            AVG(p.hit_rate) as avg_rate,
+            COUNT(*) as count
+        FROM prediction_runs p
+        WHERE p.status = 'REVIEWED'
+          AND p.issue_no IN (
+              SELECT issue_no FROM draws 
+              ORDER BY draw_date DESC, issue_no DESC LIMIT ?
+          )
+        GROUP BY p.strategy
+        ORDER BY avg_rate DESC, avg_hit DESC
+        LIMIT ?
+    """, (window, top_n + 2)).fetchall()
+    
+    if len(rows) >= 2:   # 至少有2个策略有记录就动态选择
+        top_strats = [r["strategy"] for r in rows[:top_n]]
+        print(f"[Final Rec] 当前最强Top{top_n}策略（基于最近{window}期）: {top_strats}")
+        return top_strats
     else:
-        rows = conn.execute("""
-            SELECT p.strategy, AVG(p.hit_count) as avg_hit, AVG(p.hit_rate) as avg_rate, COUNT(*) as count
-            FROM prediction_runs p
-            WHERE p.status = 'REVIEWED'
-              AND p.issue_no IN (SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?)
-            GROUP BY p.strategy
-            ORDER BY avg_rate DESC, avg_hit DESC
-            LIMIT ?
-        """, (window, top_n)).fetchall()
-        get_top_strategies.has_printed = True
-
-    if len(rows) == 0:
-        print("[Final Rec] 暂无REVIEWED历史记录，使用默认强组合 (ml_v1 + ensemble_v2 + hot_v1)")
+        # 没有足够历史数据时，使用高质量固定组合（只提示一次）
+        if not hasattr(get_top_strategies, "has_warned"):
+            print("[Final Rec] 暂无足够REVIEWED历史记录，使用高质量默认强组合: ML + 集成 + 热号")
+            get_top_strategies.has_warned = True
         return ["ml_v1", "ensemble_v2", "hot_v1"]
 
-    top_strats = [r["strategy"] for r in rows]
-    print(f"[Final Rec] 当前最强策略: {top_strats}")
-    return top_strats
 
+# ==================== 其他函数（保持不变） ====================
+_HAS_WARNED_DATA_INSUFFICIENT = False
 
 def get_dynamic_final_recommendation(conn: sqlite3.Connection):
     """智能最终推荐 + 置信度分数"""
+    global _HAS_WARNED_DATA_INSUFFICIENT
     row = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if not row:
         return None
@@ -725,7 +726,9 @@ def get_dynamic_final_recommendation(conn: sqlite3.Connection):
             weights.append(max(hit_rate, 0.55))
 
     if len(main_pools) < 2:
-        print("[Final Rec] 当前预测数据不足，使用默认推荐")
+        if not _HAS_WARNED_DATA_INSUFFICIENT:
+            print("[Final Rec] 当前预测数据不足，使用默认推荐")
+            _HAS_WARNED_DATA_INSUFFICIENT = True
         pool6 = [13, 25, 37, 8, 19, 42]
         special = 28
         confidence = 65
@@ -828,26 +831,20 @@ def get_review_stats(conn: sqlite3.Connection) -> List[sqlite3.Row]:
 
 
 def print_dashboard(conn: sqlite3.Connection) -> None:
-    """干净版仪表盘 —— 彻底解决重复打印问题"""
     print("\n" + "="*85)
     print("                  香港六合彩 · 智能预测仪表盘")
     print("="*85)
 
-    # 最新开奖
     latest = get_latest_draw(conn)
     if latest:
         nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
-        # 修复：sqlite3.Row 对象不能使用 .get()，直接使用 ['draw_date']
         print(f"最新开奖: {latest['issue_no']} {latest['draw_date']} | 主号: {nums} | 特别号: {latest['special_number']:02d}")
 
-    # 生肖信息
     hot, cold = get_hot_cold_zodiacs(conn, window=3, top_n=3)
     print(f"最近3期热门生肖: {', '.join(hot)}   |  冷门生肖: {', '.join(cold)}")
 
-    # 最终推荐（只调用一次）
     print_final_recommendation(conn)
 
-    # 策略统计
     print("\n📊 各策略历史表现（已复盘）：")
     stats = get_review_stats(conn)
     if stats:
