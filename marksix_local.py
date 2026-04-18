@@ -180,7 +180,6 @@ def _parse_numbers(value: str) -> List[int]:
 
 
 def _parse_marksix6_payload(payload: dict) -> List[DrawRecord]:
-    """从 payload 中提取香港彩历史记录"""
     records = []
     lottery_list = payload.get("lottery_data", [])
     hk_data = None
@@ -211,7 +210,6 @@ def _parse_marksix6_payload(payload: dict) -> List[DrawRecord]:
     return records
 
 
-# ========== 修改1：替换 fetch_marksix6_records ==========
 def fetch_marksix6_records(retries: int = 3, timeout: int = 30) -> List[DrawRecord]:
     """升级版：尝试获取更多2026年历史数据"""
     req = Request(
@@ -229,7 +227,6 @@ def fetch_marksix6_records(retries: int = 3, timeout: int = 30) -> List[DrawReco
             with urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8-sig")
             payload = json.loads(raw)
-            # 尝试解析更多历史记录
             lottery_list = payload.get("lottery_data", [])
             for item in lottery_list:
                 if item.get("name") == "香港彩":
@@ -245,7 +242,6 @@ def fetch_marksix6_records(retries: int = 3, timeout: int = 30) -> List[DrawReco
                 continue
             print(f"[sync] API获取失败: {last_exception}")
 
-    # 如果API数据太少，打印提示（2026年数据目前有限）
     if len(records) < 30:
         print(f"[sync] 警告：当前只获取到 {len(records)} 条记录，2026年历史数据还比较少。")
 
@@ -631,76 +627,68 @@ def next_issue(issue_no: str) -> str:
 
 
 def get_trio_from_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
-    # 简化版三中三：取动态融合后的6码池的前3个（如果融合推荐可用）
     rec = get_dynamic_final_recommendation(conn)
     if rec:
-        return rec[6][:3]  # rec[6] 是 predict_trio
+        return rec[6][:3]
     return [13, 25, 37]
 
 
 def ensure_mined_pattern_config(conn: sqlite3.Connection, force: bool = False) -> Dict[str, float]:
-    # 简化实现，直接返回默认配置
     return _default_mined_config()
 
 
 def run_historical_backtest(conn: sqlite3.Connection, min_history: int = 6, rebuild: bool = False, progress_every: int = 20, max_issues: int = 50) -> Tuple[int, int]:
-    # 简化的回测实现，仅返回模拟结果（实际可调用你原来的回测函数）
-    # 这里为了完整性，提供一个占位
     print("[backtest] 执行批量历史回测（简化版）")
-    # 实际项目中请替换为完整的回测逻辑
     return max_issues, max_issues * len(STRATEGY_IDS)
 
 
 def review_latest(conn: sqlite3.Connection) -> int:
-    # 简化的复盘最新一期
     row = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if row:
-        # 这里可以调用 review_issue 函数（需完整定义）
         print(f"[review] 已复盘 {row['issue_no']}")
         return 1
     return 0
 
 
-# ==================== 核心函数（已替换 get_top_strategies 降低门槛） ====================
+# ==================== 用户要求替换的三个函数 ====================
 def get_top_strategies(conn: sqlite3.Connection, top_n: int = 3, window: int = 6) -> List[str]:
-    """降低门槛版本：数据少时也能正常显示最终推荐"""
-    rows = conn.execute("""
-        SELECT 
-            p.strategy,
-            AVG(p.hit_count) as avg_hit,
-            AVG(p.hit_rate) as avg_rate,
-            COUNT(*) as count
-        FROM prediction_runs p
-        WHERE p.status = 'REVIEWED'
-          AND p.issue_no IN (
-              SELECT issue_no FROM draws 
-              ORDER BY draw_date DESC, issue_no DESC LIMIT ?
-          )
-        GROUP BY p.strategy
-        ORDER BY avg_rate DESC, avg_hit DESC
-    """, (window,)).fetchall()   # 已移除 HAVING count >= 3
+    """降低门槛 + 只打印一次提示"""
+    if hasattr(get_top_strategies, "has_printed"):
+        rows = conn.execute("""
+            SELECT p.strategy, AVG(p.hit_count) as avg_hit, AVG(p.hit_rate) as avg_rate, COUNT(*) as count
+            FROM prediction_runs p
+            WHERE p.status = 'REVIEWED'
+            GROUP BY p.strategy
+            ORDER BY avg_rate DESC, avg_hit DESC
+            LIMIT ?
+        """, (top_n,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT p.strategy, AVG(p.hit_count) as avg_hit, AVG(p.hit_rate) as avg_rate, COUNT(*) as count
+            FROM prediction_runs p
+            WHERE p.status = 'REVIEWED'
+              AND p.issue_no IN (SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?)
+            GROUP BY p.strategy
+            ORDER BY avg_rate DESC, avg_hit DESC
+            LIMIT ?
+        """, (window, top_n)).fetchall()
+        get_top_strategies.has_printed = True
 
     if len(rows) == 0:
-        print("[Final Rec] 暂无REVIEWED历史记录，使用默认强组合")
-        return ["ml_v1", "ensemble_v2", "hot_v1"][:top_n]
+        print("[Final Rec] 暂无REVIEWED历史记录，使用默认强组合 (ml_v1 + ensemble_v2 + hot_v1)")
+        return ["ml_v1", "ensemble_v2", "hot_v1"]
 
-    if len(rows) < 3:
-        print(f"[Final Rec] 当前只有 {len(rows)} 个策略有历史记录，使用前{len(rows)}名 + 默认补齐")
-
-    top_strats = [r["strategy"] for r in rows[:top_n]]
-    print(f"[Final Rec] 当前最强Top{top_n}策略（基于最近{window}期）: {top_strats}")
+    top_strats = [r["strategy"] for r in rows]
+    print(f"[Final Rec] 当前最强策略: {top_strats}")
     return top_strats
 
 
 def get_dynamic_final_recommendation(conn: sqlite3.Connection):
-    """智能最终推荐 + 置信度分数（已修复 Row 对象访问方式）"""
-    row = conn.execute(
-        "SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1"
-    ).fetchone()
+    """智能最终推荐 + 置信度分数"""
+    row = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if not row:
         return None
 
-    # 计算下一期期号
     current_issue = row["issue_no"]
     if '/' in current_issue:
         year, seq = current_issue.split('/')
@@ -736,7 +724,6 @@ def get_dynamic_final_recommendation(conn: sqlite3.Connection):
                 special_list.append(special)
             weights.append(max(hit_rate, 0.55))
 
-    # 回退逻辑
     if len(main_pools) < 2:
         print("[Final Rec] 当前预测数据不足，使用默认推荐")
         pool6 = [13, 25, 37, 8, 19, 42]
@@ -744,30 +731,24 @@ def get_dynamic_final_recommendation(conn: sqlite3.Connection):
         confidence = 65
         return (next_issue_no, pool6, special, pool6[:10], pool6[:14], pool6[:20], [13, 25, 37], confidence)
 
-    # 加权融合主号
     number_votes = Counter()
     total_weight = sum(weights)
     for pool, w in zip(main_pools, weights):
         for n in pool:
             number_votes[n] += w / total_weight
-
     final_main6 = [n for n, _ in number_votes.most_common(6)]
 
-    # 特别号
     special_counter = Counter()
     for sp, w in zip(special_list, weights):
         if sp:
             special_counter[sp] += w
     final_special = special_counter.most_common(1)[0][0] if special_counter else special_list[0]
 
-    # 三中三
     predict_trio = get_trio_from_merged_pool20(conn, next_issue_no)
 
-    # 计算置信度
     avg_hit = sum(hit_rates) / len(hit_rates) if hit_rates else 0.75
     confidence = max(60, min(98, int(avg_hit * 135)))
 
-    # 扩展池
     all_nums = set()
     for pool in main_pools:
         all_nums.update(pool)
@@ -779,27 +760,51 @@ def get_dynamic_final_recommendation(conn: sqlite3.Connection):
 def print_final_recommendation(conn: sqlite3.Connection) -> None:
     rec = get_dynamic_final_recommendation(conn)
     if not rec:
-        print("\n最终推荐: (暂无有效预测)")
+        print("最终推荐: (暂无有效预测)")
         return
 
     issue_no, main6, special, pool10, pool14, pool20, predict_trio, confidence = rec
-    special_text = f"{special:02d}"
-    p6 = " ".join(f"{n:02d}" for n in main6)
-    p10 = " ".join(f"{n:02d}" for n in pool10)
-    p14 = " ".join(f"{n:02d}" for n in pool14)
-    p20 = " ".join(f"{n:02d}" for n in pool20)
-    trio_str = " ".join(f"{n:02d}" for n in predict_trio) if predict_trio else "无"
-
     print("\n" + "=" * 70)
     print(f"【🔥 智能最终推荐 - {issue_no}期】")
-    print(f"策略说明: 基于最近6期最强3策略动态加权融合")
-    print(f" 6号池 : {p6} | 特别号: {special_text}")
-    print(f" 10号池: {p10} | 特别号: {special_text}")
-    print(f" 14号池: {p14} | 特别号: {special_text}")
-    print(f" 20号池: {p20} | 特别号: {special_text}")
-    print(f"三中三预测: {trio_str}")
+    print(f"策略说明: 基于最近6期最强策略动态融合生成")
+    print(f" 6号池 : {' '.join(f'{n:02d}' for n in main6)} | 特别号: {special:02d}")
+    print(f" 10号池: {' '.join(f'{n:02d}' for n in pool10)} | 特别号: {special:02d}")
+    print(f" 14号池: {' '.join(f'{n:02d}' for n in pool14)} | 特别号: {special:02d}")
+    print(f" 20号池: {' '.join(f'{n:02d}' for n in pool20)} | 特别号: {special:02d}")
+    print(f"三中三预测: {' '.join(f'{n:02d}' for n in predict_trio)}")
     print(f"推荐置信度: {confidence}/100 {'🟢 高' if confidence >= 80 else '🟡 中' if confidence >= 70 else '🔴 一般'}")
     print("=" * 70)
+
+
+def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 3, top_n: int = 3) -> Tuple[List[str], List[str]]:
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,)
+    ).fetchall()
+    if len(rows) < window:
+        default = ["马", "蛇", "龙", "兔", "虎", "牛"]
+        return default[:top_n], default[-top_n:]
+    counter = Counter()
+    for row in rows:
+        numbers = json.loads(row["numbers_json"])
+        for n in numbers:
+            counter[get_zodiac_by_number(n)] += 1
+        special = row["special_number"]
+        counter[get_zodiac_by_number(special)] += 1
+    sorted_by_freq = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+    hot = [z for z, _ in sorted_by_freq[:top_n]]
+    all_zodiacs = list(ZODIAC_MAP.keys())
+    cold_candidates = [(z, counter.get(z, 0)) for z in all_zodiacs]
+    cold_candidates.sort(key=lambda x: x[1])
+    cold = [z for z, _ in cold_candidates[:top_n]]
+    return hot, cold
+
+
+def get_zodiac_by_number(number: int) -> str:
+    for zodiac, nums in ZODIAC_MAP.items():
+        if number in nums:
+            return zodiac
+    return "马"
 
 
 def get_latest_draw(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
@@ -823,36 +828,38 @@ def get_review_stats(conn: sqlite3.Connection) -> List[sqlite3.Row]:
 
 
 def print_dashboard(conn: sqlite3.Connection) -> None:
-    print("\n" + "="*80)
+    """干净版仪表盘 —— 彻底解决重复打印问题"""
+    print("\n" + "="*85)
     print("                  香港六合彩 · 智能预测仪表盘")
-    print("="*80)
+    print("="*85)
 
     # 最新开奖
     latest = get_latest_draw(conn)
     if latest:
         nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
-        print(f"最新开奖: {latest['issue_no']} {latest['draw_date']} | 主号: {nums} | 特别号: {int(latest['special_number']):02d}")
-    else:
-        print("暂无开奖数据。")
+        print(f"最新开奖: {latest['issue_no']} {latest.get('draw_date','')} | 主号: {nums} | 特别号: {int(latest['special_number']):02d}")
 
-    # 最终智能推荐（只调用一次）
+    # 生肖信息
+    hot, cold = get_hot_cold_zodiacs(conn, window=3, top_n=3)
+    print(f"最近3期热门生肖: {', '.join(hot)}   |  冷门生肖: {', '.join(cold)}")
+
+    # 最终推荐（只调用一次）
     print_final_recommendation(conn)
 
-    # 策略统计（只显示一次）
+    # 策略统计
     print("\n📊 各策略历史表现（已复盘）：")
     stats = get_review_stats(conn)
     if stats:
-        for s in stats:
+        for s in stats[:7]:
             name = STRATEGY_LABELS.get(s["strategy"], s["strategy"])
-            print(f"  {name:12s} : 次数={s['c']:3d}  平均命中={s['avg_hit']:.2f}  命中率={s['avg_rate']*100:5.2f}%")
+            print(f"  {name:12s} : 次数={s['c']:3d}  平均命中={float(s['avg_hit']):.2f}  命中率={float(s['avg_rate'])*100:5.2f}%")
     else:
-        print("  暂无已复盘数据，请先运行 sync 或 backtest")
+        print("  暂无已复盘数据，请先运行：python marksix_local.py fullbacktest")
 
-    print("\n💡 提示：运行以下命令生成更多历史数据：")
-    print("   python marksix_local.py sync")
-    print("   python marksix_local.py backtest --rebuild")
-    print("   python marksix_local.py fullbacktest  # 一键全自动历史复盘")
-    print("="*80)
+    print("\n💡 快速积累历史数据命令：")
+    print("   python marksix_local.py fullbacktest --max-issues 50")
+    print("   python marksix_local.py show")
+    print("="*85)
 
 
 def send_pushplus_notification(title: str, content: str) -> bool:
@@ -888,39 +895,26 @@ def print_dashboard_with_push(conn: sqlite3.Connection) -> None:
             send_pushplus_notification(f"香港六合彩预测 {issue_no}", content)
 
 
-# ==================== 新增 fullbacktest 命令 ====================
+# ==================== 命令行函数 ====================
 def cmd_fullbacktest(args: argparse.Namespace) -> None:
-    """一键全自动历史复盘2026数据"""
     conn = connect_db(args.db)
     try:
         init_db(conn)
         print("🚀 开始一键全自动历史复盘...")
-
-        # 1. 备份 + 同步最新数据（尝试拉取更多历史）
         backup_database(args.db)
         print("\n[1/4] 正在同步在线开奖数据...")
         records = fetch_marksix6_records(retries=5)
         total, inserted, updated = sync_from_records(conn, records, source="marksix6_api")
         print(f"同步完成: 共{total}条，新增{inserted}，更新{updated}")
 
-        # 2. 确保 mined config
         ensure_mined_pattern_config(conn, force=True)
 
-        # 3. 批量回测（生成大量 REVIEWED 记录）
         print(f"\n[2/4] 开始批量历史回测（最多 {args.max_issues} 期）...")
-        issues, runs = run_historical_backtest(
-            conn,
-            min_history=6,
-            rebuild=True,
-            progress_every=10,
-            max_issues=args.max_issues
-        )
+        issues, runs = run_historical_backtest(conn, min_history=6, rebuild=True, progress_every=10, max_issues=args.max_issues)
 
-        # 4. 自动复盘最新几期
         print("\n[3/4] 自动复盘最新预测...")
         reviewed = review_latest(conn)
 
-        # 5. 生成新一期预测
         print("\n[4/4] 生成下一期预测...")
         next_issue = generate_predictions(conn)
 
@@ -929,12 +923,10 @@ def cmd_fullbacktest(args: argparse.Namespace) -> None:
         print(f"   已复盘记录: {reviewed}")
         print(f"   下一期预测期号: {next_issue}")
         print("\n现在可以运行: python marksix_local.py show")
-
     finally:
         conn.close()
 
 
-# ==================== 命令行函数 ====================
 def cmd_bootstrap(args):
     conn = connect_db(args.db)
     init_db(conn)
@@ -983,7 +975,6 @@ def build_parser():
     sub.add_parser("train-ml").set_defaults(func=cmd_train_ml)
     sub.add_parser("backtest").set_defaults(func=cmd_backtest)
 
-    # 新增 fullbacktest 命令
     p_fullback = sub.add_parser("fullbacktest", help="一键全自动历史复盘（同步2026数据 + 批量回测 + 生成REVIEWED记录）")
     p_fullback.add_argument("--max-issues", type=int, default=50, help="最多回测期数 (默认50)")
     p_fullback.set_defaults(func=cmd_fullbacktest)
