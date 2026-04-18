@@ -110,11 +110,22 @@ def init_db(conn: sqlite3.Connection) -> None:
             key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS strategy_performance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, issue_no TEXT NOT NULL, strategy TEXT NOT NULL,
-            main_hit_count INTEGER NOT NULL, special_hit INTEGER NOT NULL, created_at TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_no TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            main_hit_count INTEGER NOT NULL,
+            special_hit INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
             UNIQUE(issue_no, strategy)
         );
     """)
+    # 添加缺失的列（兼容旧表）
+    cursor = conn.execute("PRAGMA table_info(strategy_performance)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "main_hit_count" not in columns:
+        conn.execute("ALTER TABLE strategy_performance ADD COLUMN main_hit_count INTEGER DEFAULT 0")
+    if "special_hit" not in columns:
+        conn.execute("ALTER TABLE strategy_performance ADD COLUMN special_hit INTEGER DEFAULT 0")
     conn.commit()
 
 
@@ -200,10 +211,8 @@ def fetch_marksix6_records(retries: int = 3, timeout: int = 30) -> List[DrawReco
                 year = expect_raw[2:4]
                 seq = str(int(expect_raw[4:]))
                 issue_no = f"{year}/{seq.zfill(3)}"
-                # 日期使用当前时间近似（历史条目无精确日期，但排序靠前即可）
                 draw_date = _parse_date(hk_data.get("openTime", "").split()[0]) if hk_data.get("openTime") else "2026-01-01"
                 records.append(DrawRecord(issue_no=issue_no, draw_date=draw_date, numbers=main_numbers, special_number=special))
-            # 去重排序
             dedup = {}
             for r in records:
                 dedup[r.issue_no] = r
@@ -464,10 +473,8 @@ def train_ml_model(conn: sqlite3.Connection) -> Optional[lgb.Booster]:
     train_data = lgb.Dataset(X_train, label=y_train)
     val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
     model = lgb.train(params, train_data, valid_sets=[val_data], num_boost_round=200, callbacks=[lgb.early_stopping(10), lgb.log_evaluation(0)])
-    # 特征重要性
     importance = model.feature_importance()
     print(f"[ML] 模型训练完成，AUC: {model.best_score['valid_0']['auc']:.4f}")
-    # 保存模型
     model_bytes = pickle.dumps(model)
     set_model_state(conn, ML_MODEL_KEY, model_bytes.hex())
     return model
@@ -535,11 +542,11 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
     row = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if not row:
         raise RuntimeError("No draws found. Run bootstrap first.")
-    target_issue = issue_no or (lambda i: f"{i.split('/')[0]}/{int(i.split('/')[1])+1:03d}")(row["issue_no"])
+    target_issue = issue_no or next_issue(row["issue_no"])
     draws = load_recent_draws(conn, 6)
     if len(draws) < 6:
         raise RuntimeError("Need at least 6 draws.")
-    mined_cfg = _default_mined_config()  # 简化，实际可调用ensure_mined_pattern_config
+    mined_cfg = _default_mined_config()
     strategy_weights = get_strategy_weights(conn, window=6)
 
     # 检查ML是否需要重新训练（每5期）
@@ -562,7 +569,6 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
         main_numbers = [n for n,_,_,_ in picks]
         conn.executemany("INSERT INTO prediction_picks(run_id, pick_type, number, rank, score, reason) VALUES (?, 'MAIN', ?, ?, ?, ?)", [(run_id, n, rank, score, reason) for n, rank, score, reason in picks])
         conn.execute("INSERT INTO prediction_picks(run_id, pick_type, number, rank, score, reason) VALUES (?, 'SPECIAL', ?, 1, ?, ?)", (run_id, special_number, special_score, "特别号候选"))
-        # 构建候选池
         ranked = [n for n, _ in sorted(score_map.items(), key=lambda x: x[1], reverse=True)]
         main_unique = []
         for n in main_numbers:
@@ -577,65 +583,14 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
     return target_issue
 
 
-def get_top_strategies(conn: sqlite3.Connection, top_n: int = 3, window: int = 6) -> List[str]:
-    rows = conn.execute("""
-        SELECT strategy, AVG(main_hit_count) as avg_hit, AVG(hit_rate) as avg_rate, COUNT(*) as count
-        FROM prediction_runs WHERE status = 'REVIEWED'
-        AND issue_no IN (SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?)
-        GROUP BY strategy HAVING count >= 3 ORDER BY avg_rate DESC, avg_hit DESC
-    """, (window,)).fetchall()
-    if len(rows) < 3:
-        return ["ml_v1", "ensemble_v2", "hot_v1"][:top_n]
-    return [r["strategy"] for r in rows[:top_n]]
-
-
-def get_dynamic_final_recommendation(conn: sqlite3.Connection):
-    # 获取最新期号
-    latest_row = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
-    if not latest_row:
-        return None
-    parts = latest_row["issue_no"].split("/")
-    next_issue = f"{parts[0]}/{int(parts[1])+1:03d}"
-    # 获取最近6期表现最好的3个策略
-    top_strats = get_top_strategies(conn, 3, 6)
-    print(f"[动态融合] 使用策略: {top_strats}")
-    # 获取这些策略对下一期的预测（PENDING）
-    main_votes = Counter()
-    special_votes = Counter()
-    for strat in top_strats:
-        run = conn.execute("SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'", (next_issue, strat)).fetchone()
-        if run:
-            main6, special = get_picks_for_run(conn, run["id"])
-            for n in main6:
-                main_votes[n] += 1
-            if special:
-                special_votes[special] += 1
-    # 融合主号：取投票最多的前6个
-    if main_votes:
-        fused_main = [n for n, _ in sorted(main_votes.items(), key=lambda x: (-x[1], x[0]))[:6]]
-    else:
-        fused_main = [1,2,3,4,5,6]
-    # 特别号：投票最多
-    if special_votes:
-        fused_special = max(special_votes.items(), key=lambda x: (x[1], -x[0]))[0]
-    else:
-        fused_special = 7
-    # 三中三：从fused_main中取前3个
-    fused_trio = fused_main[:3] if len(fused_main) >= 3 else fused_main + [1,2,3][:3-len(fused_main)]
-    # 置信度：基于策略的平均命中率
-    avg_hit_rate = 0.0
-    cnt = 0
-    for strat in top_strats:
-        row = conn.execute("SELECT AVG(hit_rate) as avg_rate FROM prediction_runs WHERE strategy = ? AND status='REVIEWED' AND issue_no IN (SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 6)", (strat,)).fetchone()
-        if row and row["avg_rate"]:
-            avg_hit_rate += row["avg_rate"]
-            cnt += 1
-    confidence = int((avg_hit_rate / cnt) * 100) if cnt else 70
-    # 构建池（简单示例）
-    pool10 = fused_main + [n for n in ALL_NUMBERS if n not in fused_main][:4]
-    pool14 = fused_main + [n for n in ALL_NUMBERS if n not in fused_main][:8]
-    pool20 = fused_main + [n for n in ALL_NUMBERS if n not in fused_main][:14]
-    return (next_issue, fused_main, fused_special, pool10, pool14, pool20, fused_trio, confidence)
+def get_pool_numbers_for_run(conn: sqlite3.Connection, run_id: int, pool_size: int = 6) -> List[int]:
+    row = conn.execute("SELECT numbers_json FROM prediction_pools WHERE run_id = ? AND pool_size = ?", (run_id, pool_size)).fetchone()
+    if not row:
+        return []
+    try:
+        return json.loads(row["numbers_json"])
+    except:
+        return []
 
 
 def get_picks_for_run(conn: sqlite3.Connection, run_id: int) -> Tuple[List[int], Optional[int]]:
@@ -645,24 +600,149 @@ def get_picks_for_run(conn: sqlite3.Connection, run_id: int) -> Tuple[List[int],
     return mains, specials[0] if specials else None
 
 
+def next_issue(issue_no: str) -> str:
+    parts = issue_no.split("/")
+    return f"{parts[0]}/{int(parts[1])+1:03d}"
+
+
+def get_trio_from_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
+    # 简化版三中三：取融合后的6码池的前3个
+    rec = get_dynamic_final_recommendation(conn)
+    if rec:
+        return rec[6][:3]  # rec[6] 是 predict_trio
+    return [13, 25, 37]
+
+
+# ==================== 用户提供的三个函数（已替换） ====================
+def get_top_strategies(conn: sqlite3.Connection, top_n: int = 3, window: int = 6) -> List[str]:
+    """自动选择当前最强Top3策略（基于最近6期）—— 已修复字段问题"""
+    rows = conn.execute("""
+        SELECT 
+            p.strategy,
+            AVG(p.hit_count) as avg_hit,
+            AVG(p.hit_rate) as avg_rate,
+            COUNT(*) as count
+        FROM prediction_runs p
+        WHERE p.status = 'REVIEWED'
+          AND p.issue_no IN (
+              SELECT issue_no FROM draws 
+              ORDER BY draw_date DESC, issue_no DESC LIMIT ?
+          )
+        GROUP BY p.strategy
+        HAVING count >= 3
+        ORDER BY avg_rate DESC, avg_hit DESC
+    """, (window,)).fetchall()
+    
+    if len(rows) < 3:
+        print(f"[Final Rec] 历史数据不足（只有 {len(rows)} 个策略有记录），使用默认强组合")
+        return ["ml_v1", "ensemble_v2", "hot_v1"][:top_n]
+    
+    top_strats = [r["strategy"] for r in rows[:top_n]]
+    print(f"[Final Rec] 当前最强Top{top_n}策略（基于最近{window}期）: {top_strats}")
+    return top_strats
+
+
+def get_dynamic_final_recommendation(conn: sqlite3.Connection):
+    """智能最终推荐 + 置信度分数"""
+    row = conn.execute(
+        "SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    
+    issue_no = next_issue(row["issue_no"])
+    
+    top_strats = get_top_strategies(conn, top_n=3, window=6)
+    
+    main_pools = []
+    special_list = []
+    weights = []
+    hit_rates = []
+    
+    for strat in top_strats:
+        run = conn.execute(
+            "SELECT id, hit_rate FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
+            (issue_no, strat)
+        ).fetchone()
+        if not run:
+            continue
+        run_id = run["id"]
+        hit_rate = float(run.get("hit_rate") or 0.75)
+        hit_rates.append(hit_rate)
+        
+        pool6 = get_pool_numbers_for_run(conn, run_id, 6)
+        _, special = get_picks_for_run(conn, run_id)
+        
+        if pool6 and len(pool6) == 6:
+            main_pools.append(pool6)
+            if special is not None:
+                special_list.append(special)
+            weights.append(max(hit_rate, 0.55))
+    
+    # 回退逻辑
+    if len(main_pools) < 2:
+        print("[Final Rec] 数据不足，回退到默认推荐")
+        pool6 = [13, 25, 37, 8, 19, 42]
+        special = 28
+        confidence = 65
+        return (issue_no, pool6, special, pool6[:10], pool6[:14], pool6[:20], [13, 25, 37], confidence)
+    
+    # 加权融合
+    number_votes = Counter()
+    total_weight = sum(weights)
+    for pool, w in zip(main_pools, weights):
+        for n in pool:
+            number_votes[n] += w / total_weight
+    
+    final_main6 = [n for n, _ in number_votes.most_common(6)]
+    
+    special_counter = Counter()
+    for sp, w in zip(special_list, weights):
+        if sp:
+            special_counter[sp] += w
+    final_special = special_counter.most_common(1)[0][0] if special_counter else special_list[0]
+    
+    predict_trio = get_trio_from_merged_pool20(conn, issue_no)
+    
+    # 计算置信度
+    avg_hit = sum(hit_rates) / len(hit_rates) if hit_rates else 0.75
+    confidence = max(60, min(98, int(avg_hit * 135)))   # 转换为更直观的0-100分
+    
+    all_nums = set()
+    for pool in main_pools:
+        all_nums.update(pool)
+    sorted_all = sorted(all_nums, key=lambda x: number_votes.get(x, 0), reverse=True)
+    
+    return (issue_no, final_main6, final_special, sorted_all[:10], sorted_all[:14], sorted_all[:20], predict_trio, confidence)
+
+
 def print_final_recommendation(conn: sqlite3.Connection) -> None:
     rec = get_dynamic_final_recommendation(conn)
     if not rec:
-        print("暂无推荐")
+        print("\n最终推荐: (暂无有效预测)")
         return
-    issue_no, main6, special, p10, p14, p20, trio, confidence = rec
-    print("\n" + "="*70)
+    
+    issue_no, main6, special, pool10, pool14, pool20, predict_trio, confidence = rec
+    special_text = f"{special:02d}"
+    p6 = " ".join(f"{n:02d}" for n in main6)
+    p10 = " ".join(f"{n:02d}" for n in pool10)
+    p14 = " ".join(f"{n:02d}" for n in pool14)
+    p20 = " ".join(f"{n:02d}" for n in pool20)
+    trio_str = " ".join(f"{n:02d}" for n in predict_trio) if predict_trio else "无"
+    
+    print("\n" + "=" * 70)
     print(f"【🔥 智能最终推荐 - {issue_no}期】")
-    print(f"基于最近6期最强3策略融合生成")
-    print(f"6号池 : {' '.join(f'{n:02d}' for n in main6)} | 特别号: {special:02d}")
-    print(f"10号池: {' '.join(f'{n:02d}' for n in p10)}")
-    print(f"14号池: {' '.join(f'{n:02d}' for n in p14)}")
-    print(f"20号池: {' '.join(f'{n:02d}' for n in p20)}")
-    print(f"三中三推荐: {' '.join(f'{n:02d}' for n in trio)}")
-    print(f"推荐置信度: {confidence}/100")
-    print("="*70)
+    print(f"策略说明: 基于最近6期最强3策略动态加权融合生成")
+    print(f" 6号池 : {p6} | 特别号: {special_text}")
+    print(f" 10号池: {p10} | 特别号: {special_text}")
+    print(f" 14号池: {p14} | 特别号: {special_text}")
+    print(f" 20号池: {p20} | 特别号: {special_text}")
+    print(f"三中三预测: {trio_str}")
+    print(f"推荐置信度: {confidence}/100 {'🟢 高' if confidence >= 80 else '🟡 中' if confidence >= 70 else '🔴 一般'}")
+    print("=" * 70)
 
 
+# ==================== 推送与仪表盘 ====================
 def send_pushplus_notification(title: str, content: str) -> bool:
     if not PUSHPLUS_TOKEN:
         print("[推送] 未配置 PUSHPLUS_TOKEN，跳过")
@@ -702,7 +782,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             send_pushplus_notification(f"香港六合彩预测 {issue_no}", content)
 
 
-# ==================== 命令行函数（简化版，仅展示关键命令） ====================
+# ==================== 命令行函数 ====================
 def cmd_bootstrap(args):
     conn = connect_db(args.db)
     init_db(conn)
@@ -736,6 +816,10 @@ def cmd_train_ml(args):
     conn.close()
 
 
+def cmd_backtest(args):
+    print("回测功能暂未实现，可使用历史数据手动验证。")
+
+
 def build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--db", default=DB_PATH_DEFAULT)
@@ -744,6 +828,7 @@ def build_parser():
     sub.add_parser("sync").set_defaults(func=cmd_sync)
     sub.add_parser("show").set_defaults(func=cmd_show)
     sub.add_parser("train-ml").set_defaults(func=cmd_train_ml)
+    sub.add_parser("backtest").set_defaults(func=cmd_backtest)
     return p
 
 
