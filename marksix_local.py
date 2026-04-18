@@ -62,7 +62,7 @@ ZODIAC_MAP = {
     "羊": [12, 24, 36, 48],
 }
 
-PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
+PUSHPLUS_TOKEN = "7045c58ecdfd490f859992abeaa0d557"
 
 
 @dataclass
