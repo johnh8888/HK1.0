@@ -837,7 +837,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     latest = get_latest_draw(conn)
     if latest:
         nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
-        print(f"最新开奖: {latest['issue_no']} {latest.get('draw_date','')} | 主号: {nums} | 特别号: {int(latest['special_number']):02d}")
+        # 修复：sqlite3.Row 对象不能使用 .get()，直接使用 ['draw_date']
+        print(f"最新开奖: {latest['issue_no']} {latest['draw_date']} | 主号: {nums} | 特别号: {latest['special_number']:02d}")
 
     # 生肖信息
     hot, cold = get_hot_cold_zodiacs(conn, window=3, top_n=3)
