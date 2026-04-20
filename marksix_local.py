@@ -2121,35 +2121,32 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
 def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     if not rows:
         return ["马", "蛇"]
-    # 香港校准：decay=0.12（比澳门0.10略慢，适合每周三次节奏）
+    # 香港校准：decay=0.12（比澳门0.08更平缓），惩罚-0.15（适中）
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.12)
-    # 减弱对近期已出特别号生肖的惩罚（香港热号延续性略弱）
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
         zodiac_scores[z] -= 0.15
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
+
 def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     two_zodiac = _get_two_zodiac_from_history_rows(rows)
     if not rows:
         return two_zodiac[0] if two_zodiac else "马"
 
-    # 香港校准：decay=0.12，冷号加分适度降低至3.5
+    # 香港校准：decay=0.12，冷号加分3.5（避免过激），绑定加分3.0
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.12)
     recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
     zodiac_counter = Counter(recent_zodiacs)
     if zodiac_counter:
         coldest = min(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
         zodiac_scores[coldest] += 3.5
-
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
         zodiac_scores[z] -= 0.15
-
     for z in two_zodiac:
         zodiac_scores[z] += 3.0
-
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     for candidate, _ in ranked:
         if candidate in two_zodiac:
