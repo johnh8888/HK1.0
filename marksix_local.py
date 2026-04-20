@@ -2128,7 +2128,6 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
-
 def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     two_zodiac = _get_two_zodiac_from_history_rows(rows)
     if not rows:
