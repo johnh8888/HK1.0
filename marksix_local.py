@@ -2127,41 +2127,6 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
-def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int = 3) -> Tuple[List[str], List[str]]:
-    rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
-        (window,)
-    ).fetchall()
-    if len(rows) < window:
-        default = ["马", "蛇", "龙", "兔", "虎", "牛"]
-        return default[:top_n], default[-top_n:]
-    score_counter: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
-    for idx, row in enumerate(rows):
-        recency_w = 1.0 / (1.0 + idx * 0.35)
-        numbers = json.loads(row["numbers_json"])
-        for n in numbers:
-            score_counter[get_zodiac_by_number(n)] += 1.0 * recency_w
-        special = row["special_number"]
-        score_counter[get_zodiac_by_number(special)] += 1.2 * recency_w
-    sorted_by_freq = sorted(score_counter.items(), key=lambda x: x[1], reverse=True)
-    hot = [z for z, _ in sorted_by_freq[:top_n]]
-    all_zodiacs = list(ZODIAC_MAP.keys())
-    cold_candidates = [(z, score_counter.get(z, 0.0)) for z in all_zodiacs]
-    cold_candidates.sort(key=lambda x: x[1])
-    cold = [z for z, _ in cold_candidates[:top_n]]
-    return hot, cold
-
-
-def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
-    if not rows:
-        return ["马", "蛇"]
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
-    for z in recent_special_zodiacs:
-        zodiac_scores[z] -= 0.2
-    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
-
 
 def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     two_zodiac = _get_two_zodiac_from_history_rows(rows)
@@ -2628,7 +2593,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
         )
 
-    zodiac_report = get_recent_single_zodiac_report(conn, lookback=20, history_window=16)
+    zodiac_report = get_recent_single_zodiac_report(conn, lookback=20, history_window=14)
     print("\n单生肖复盘（最近20期）:")
     print(
         f"  - 最近样本={int(zodiac_report['samples'])}期 "
