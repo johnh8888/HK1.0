@@ -1999,15 +1999,14 @@ def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row], decay: float = 0
         numbers = json.loads(row["numbers_json"])
         for n in numbers:
             zodiac_scores[get_zodiac_by_number(int(n))] += 1.0 * recency_w
-        zodiac_scores[get_zodiac_by_number(int(row["special_number"]))] += 1.8 * recency_w
+        zodiac_scores[get_zodiac_by_number(int(row["special_number"]))] += 1.2 * recency_w   # 1.8 → 1.2
     for z in zodiac_scores:
         omit = omission_map.get(z, len(rows))
         if omit >= 6:
-            zodiac_scores[z] += min(3.0, omit / 4.0)
+            zodiac_scores[z] += min(2.0, omit / 5.0)   # 新增温和遗漏奖励
         elif omit >= 3:
-            zodiac_scores[z] += omit / 6.0
+            zodiac_scores[z] += omit / 8.0
     return zodiac_scores
-
 
 def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 16) -> List[str]:
     rows = conn.execute(
@@ -2017,36 +2016,30 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     if not rows:
         return ["马", "蛇"]
 
-    # 基础生肖得分
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
     omission_map = _zodiac_omission_map(rows)
 
-    # 遗漏保护：阈值8期
     force_include = []
     for z, omit in omission_map.items():
-        if omit >= 8:
+        if omit >= 10:   # 8 → 10
             force_include.append(z)
 
-    # 结合20码池
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     if pool20:
         pool_zodiacs = [get_zodiac_by_number(n) for n in pool20]
         for z, cnt in Counter(pool_zodiacs).items():
-            zodiac_scores[z] += cnt * 0.6
+            zodiac_scores[z] += cnt * 0.5   # 0.6 → 0.5
 
-    # 特别号投票加分
     top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
     if top_special_votes:
         for sp in top_special_votes:
-            zodiac_scores[get_zodiac_by_number(sp)] += 1.5
+            zodiac_scores[get_zodiac_by_number(sp)] += 1.2   # 1.5 → 1.2
 
-    # ---------- 上期未命中补偿 ----------
     prev_issue = _get_previous_issue(conn, issue_no)
     prev_hit = False
     if prev_issue:
         prev_hit = _check_two_zodiac_hit(conn, prev_issue)
 
-    # ===== 绝对兜底：上期未命中则直接返回上期最热两个生肖 =====
     if not prev_hit and prev_issue:
         prev_draw = conn.execute(
             "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
@@ -2059,11 +2052,8 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
             prev_zodiacs.append(get_zodiac_by_number(prev_draw["special_number"]))
             hot_two = [z for z, _ in Counter(prev_zodiacs).most_common(2)]
             if len(hot_two) >= 2:
-                # 调试输出（回测时可见）
-                # print(f"[双生肖强制补偿] 期号{issue_no} 上期{prev_issue}未中，直接返回{hot_two}")
                 return hot_two[:2]
 
-    # 正常流程
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = []
     for z in force_include:
@@ -2075,16 +2065,13 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
         if z not in picks:
             picks.append(z)
 
-    # 兜底：如果仍未满两个，用最高分补齐
     if len(picks) < 2:
         for z, _ in ranked:
             if z not in picks:
                 picks.append(z)
                 if len(picks) == 2:
                     break
-
     return picks[:2]
-
 
 def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 14) -> str:
     two_zodiac = get_two_zodiac_picks(conn, issue_no, window)
@@ -2095,46 +2082,48 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
     if not rows:
         return two_zodiac[0] if two_zodiac else "马"
 
-    # 更短窗口 + 更激进的 decay
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.05)
-    
-    # 动态遗漏加分：遗漏期数直接乘以系数
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)   # 0.05 → 0.10
     omission_map = _zodiac_omission_map(rows)
     for z in zodiac_scores:
         omit = omission_map.get(z, len(rows))
-        zodiac_scores[z] += min(5.0, omit * 0.8)   # 遗漏20期加16分，上限5分
+        zodiac_scores[z] += min(3.0, omit * 0.6)   # 5.0→3.0, 0.8→0.6
 
-    # 明确倾向最冷生肖
     coldest_zodiac = max(omission_map.keys(), key=lambda z: omission_map[z])
-    zodiac_scores[coldest_zodiac] += 5.0   # 强化冷回补
+    zodiac_scores[coldest_zodiac] += 3.0   # 5.0 → 3.0
 
-    # 结合20码池（权重提升）
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     if pool20:
         pool_zodiacs = [get_zodiac_by_number(n) for n in pool20]
         for z, cnt in Counter(pool_zodiacs).items():
-            zodiac_scores[z] += cnt * 0.8   # 原0.5 → 0.8
+            zodiac_scores[z] += cnt * 0.6   # 0.8 → 0.6
 
-    # 特别号投票加分（权重提升）
     top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
     if top_special_votes:
         for sp in top_special_votes:
-            zodiac_scores[get_zodiac_by_number(sp)] += 2.5   # 原1.8 → 2.5
+            zodiac_scores[get_zodiac_by_number(sp)] += 2.0   # 2.5 → 2.0
 
-    # 减弱近期重复惩罚
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
-        zodiac_scores[z] -= 0.1   # 原-0.3 → -0.1
+        zodiac_scores[z] -= 0.15   # -0.1 → -0.15
 
-    # 倾向双生肖推荐（绑定加强）
     for z in two_zodiac:
-        zodiac_scores[z] += 4.0   # 原3.0 → 4.0
+        zodiac_scores[z] += 3.0   # 4.0 → 3.0
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     for candidate, _ in ranked:
         if candidate in two_zodiac:
             return candidate
     return ranked[0][0]
+
+def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
+    if not rows:
+        return ["马", "蛇"]
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+    for z in recent_special_zodiacs:
+        zodiac_scores[z] -= 0.1   # -0.2 → -0.1
+    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
+    return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
 
 def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int = 3) -> Tuple[List[str], List[str]]:
