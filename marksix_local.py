@@ -2121,12 +2121,12 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
 def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     if not rows:
         return ["马", "蛇"]
-    
-    # 香港校准：decay=0.09，遗漏阈值6期
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.09)
+
+    # 香港激进校准：decay=0.07，遗漏阈值5期
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.07)
     omission_map = _zodiac_omission_map(rows)
-    force_include = [z for z, omit in omission_map.items() if omit >= 6]
-    
+    force_include = [z for z, omit in omission_map.items() if omit >= 5]
+
     recent_rows = rows[:3]
     recent_zodiac_counts = Counter()
     for r in recent_rows:
@@ -2135,14 +2135,15 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
             recent_zodiac_counts[get_zodiac_by_number(n)] += 1
         recent_zodiac_counts[get_zodiac_by_number(r["special_number"])] += 1
     hot_zodiacs = [z for z, c in recent_zodiac_counts.items() if c >= 2]
-    
+
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
         if z not in hot_zodiacs:
-            zodiac_scores[z] -= 0.18
+            zodiac_scores[z] -= 0.15
         else:
-            zodiac_scores[z] -= 0.05
-    
+            zodiac_scores[z] -= 0.03
+
+    # 连续未命中检测与强制兜底
     prev_hit = False
     prev_prev_hit = False
     if len(rows) > 1:
@@ -2152,12 +2153,13 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
         prev_zodiacs = [get_zodiac_by_number(n) for n in prev_main]
         prev_zodiacs.append(get_zodiac_by_number(prev_special))
         hot_prev = Counter(prev_zodiacs).most_common(2)
-        
+
+        # 模拟上一期推荐
         if len(rows) > 2:
             hist_prev = rows[2:]
-            zodiac_scores_prev = _build_zodiac_scores_from_rows(hist_prev, decay=0.09)
+            zodiac_scores_prev = _build_zodiac_scores_from_rows(hist_prev, decay=0.07)
             omission_prev = _zodiac_omission_map(hist_prev)
-            force_prev = [z for z, omit in omission_prev.items() if omit >= 6]
+            force_prev = [z for z, omit in omission_prev.items() if omit >= 5]
             ranked_prev = sorted(zodiac_scores_prev.items(), key=lambda x: (-x[1], x[0]))
             picks_prev = []
             for z in force_prev:
@@ -2167,7 +2169,8 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
                 if z not in picks_prev: picks_prev.append(z)
             picks_prev = picks_prev[:2] if len(picks_prev) >= 2 else ["马", "蛇"]
             prev_hit = any(z in set(prev_zodiacs) for z in picks_prev)
-        
+
+        # 模拟上上期推荐
         if len(rows) > 2:
             prev_prev_draw = rows[2]
             prev_prev_main = json.loads(prev_prev_draw["numbers_json"])
@@ -2176,9 +2179,9 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
             prev_prev_zodiacs.append(get_zodiac_by_number(prev_prev_special))
             if len(rows) > 3:
                 hist_prev_prev = rows[3:]
-                zodiac_scores_prev_prev = _build_zodiac_scores_from_rows(hist_prev_prev, decay=0.09)
+                zodiac_scores_prev_prev = _build_zodiac_scores_from_rows(hist_prev_prev, decay=0.07)
                 omission_prev_prev = _zodiac_omission_map(hist_prev_prev)
-                force_prev_prev = [z for z, omit in omission_prev_prev.items() if omit >= 6]
+                force_prev_prev = [z for z, omit in omission_prev_prev.items() if omit >= 5]
                 ranked_prev_prev = sorted(zodiac_scores_prev_prev.items(), key=lambda x: (-x[1], x[0]))
                 picks_prev_prev = []
                 for z in force_prev_prev:
@@ -2188,14 +2191,17 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
                     if z not in picks_prev_prev: picks_prev_prev.append(z)
                 picks_prev_prev = picks_prev_prev[:2] if len(picks_prev_prev) >= 2 else ["马", "蛇"]
                 prev_prev_hit = any(z in set(prev_prev_zodiacs) for z in picks_prev_prev)
-        
+
+        # 连续两期未中：强制返回最近一期特别号生肖 + 上期最热主号生肖
         if not prev_hit and not prev_prev_hit:
             recent_sp_zodiac = get_zodiac_by_number(int(rows[0]["special_number"]))
             hot_main_prev = Counter([get_zodiac_by_number(n) for n in prev_main]).most_common(1)[0][0]
             return [recent_sp_zodiac, hot_main_prev]
+        # 单期未中：强制返回上期最热两个生肖
         if not prev_hit:
             return [z for z, _ in hot_prev][:2]
-    
+
+    # 正常流程
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = []
     for z in force_include:
@@ -2210,34 +2216,32 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
                 if len(picks) == 2: break
     return picks[:2]
 
-
 def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     two_zodiac = _get_two_zodiac_from_history_rows(rows)
     if not rows:
         return two_zodiac[0] if two_zodiac else "马"
 
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.06)
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.05)   # 更激进
     omission_map = _zodiac_omission_map(rows)
     for z in zodiac_scores:
         omit = omission_map.get(z, len(rows))
-        zodiac_scores[z] += min(5.0, omit * 0.8)
+        zodiac_scores[z] += min(6.0, omit * 0.9)      # 遗漏加分增强
     coldest_zodiac = max(omission_map.keys(), key=lambda z: omission_map[z])
-    zodiac_scores[coldest_zodiac] += 5.0
+    zodiac_scores[coldest_zodiac] += 6.0               # 最冷加分增强
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:5]]
     special_counter = Counter(recent_special_zodiacs)
     for z, cnt in special_counter.most_common(3):
-        zodiac_scores[z] += cnt * 0.9
+        zodiac_scores[z] += cnt * 1.0                  # 特别号频率加成提高
     recent_sp_zod = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_sp_zod:
-        zodiac_scores[z] -= 0.12
+        zodiac_scores[z] -= 0.1                        # 惩罚减轻
     for z in two_zodiac:
-        zodiac_scores[z] += 4.5
+        zodiac_scores[z] += 5.0                        # 绑定加分增强
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     for candidate, _ in ranked:
         if candidate in two_zodiac:
             return candidate
     return ranked[0][0]
-
 def get_recent_single_zodiac_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
