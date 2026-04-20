@@ -2121,114 +2121,40 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
 def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     if not rows:
         return ["马", "蛇"]
-
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
-    omission_map = _zodiac_omission_map(rows)
-
-    force_include = [z for z, omit in omission_map.items() if omit >= 8]
-
-    recent_rows = rows[:3]
-    recent_zodiac_counts = Counter()
-    for r in recent_rows:
-        nums = json.loads(r["numbers_json"])
-        for n in nums:
-            recent_zodiac_counts[get_zodiac_by_number(n)] += 1
-        recent_zodiac_counts[get_zodiac_by_number(r["special_number"])] += 1
-    hot_zodiacs = [z for z, c in recent_zodiac_counts.items() if c >= 2]
-
+    # 香港校准：decay=0.12（比澳门0.10略慢，适合每周三次节奏）
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.12)
+    # 减弱对近期已出特别号生肖的惩罚（香港热号延续性略弱）
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
-        if z not in hot_zodiacs:
-            zodiac_scores[z] -= 0.2
-        else:
-            zodiac_scores[z] -= 0.05
-
-    prev_hit = False
-    if len(rows) > 1:
-        prev_draw = rows[1]
-        prev_main = json.loads(prev_draw["numbers_json"])
-        prev_special = int(prev_draw["special_number"])
-        prev_zodiacs = [get_zodiac_by_number(n) for n in prev_main]
-        prev_zodiacs.append(get_zodiac_by_number(prev_special))
-        hot_prev = Counter(prev_zodiacs).most_common(2)
-
-        if len(rows) > 2:
-            hist_prev = rows[2:]
-            zodiac_scores_prev = _build_zodiac_scores_from_rows(hist_prev, decay=0.08)
-            omission_prev = _zodiac_omission_map(hist_prev)
-            force_prev = [z for z, omit in omission_prev.items() if omit >= 8]
-            ranked_prev = sorted(zodiac_scores_prev.items(), key=lambda x: (-x[1], x[0]))
-            picks_prev = []
-            for z in force_prev:
-                if z not in picks_prev:
-                    picks_prev.append(z)
-            for z, _ in ranked_prev:
-                if len(picks_prev) >= 2:
-                    break
-                if z not in picks_prev:
-                    picks_prev.append(z)
-            picks_prev = picks_prev[:2] if len(picks_prev) >= 2 else ["马", "蛇"]
-            target_zodiacs = set(prev_zodiacs)
-            prev_hit = any(z in target_zodiacs for z in picks_prev)
-
-        if not prev_hit:
-            return [z for z, _ in hot_prev][:2]
-
+        zodiac_scores[z] -= 0.15
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    picks = []
-    for z in force_include:
-        if z not in picks:
-            picks.append(z)
-    for z, _ in ranked:
-        if len(picks) >= 2:
-            break
-        if z not in picks:
-            picks.append(z)
-
-    if not prev_hit and len(rows) > 1:
-        hot_prev = Counter(prev_zodiacs).most_common(2)
-        for z, _ in hot_prev:
-            if z not in picks and len(picks) == 2:
-                picks[-1] = z
-            elif z not in picks:
-                picks.append(z)
-
-    return picks[:2] if len(picks) >= 2 else ["马", "蛇"]
-
+    return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
 def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     two_zodiac = _get_two_zodiac_from_history_rows(rows)
     if not rows:
         return two_zodiac[0] if two_zodiac else "马"
 
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.05)
-    omission_map = _zodiac_omission_map(rows)
+    # 香港校准：decay=0.12，冷号加分适度降低至3.5
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.12)
+    recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
+    zodiac_counter = Counter(recent_zodiacs)
+    if zodiac_counter:
+        coldest = min(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
+        zodiac_scores[coldest] += 3.5
 
-    for z in zodiac_scores:
-        omit = omission_map.get(z, len(rows))
-        zodiac_scores[z] += min(5.0, omit * 0.8)
-
-    coldest_zodiac = max(omission_map.keys(), key=lambda z: omission_map[z])
-    zodiac_scores[coldest_zodiac] += 5.0
-
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:5]]
-    special_counter = Counter(recent_special_zodiacs)
-    for z, cnt in special_counter.most_common(3):
-        zodiac_scores[z] += cnt * 0.8
-
-    recent_sp_zod = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
-    for z in recent_sp_zod:
-        zodiac_scores[z] -= 0.1
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+    for z in recent_special_zodiacs:
+        zodiac_scores[z] -= 0.15
 
     for z in two_zodiac:
-        zodiac_scores[z] += 4.0
+        zodiac_scores[z] += 3.0
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     for candidate, _ in ranked:
         if candidate in two_zodiac:
             return candidate
     return ranked[0][0]
-
 
 def get_recent_single_zodiac_report(
     conn: sqlite3.Connection,
