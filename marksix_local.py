@@ -2122,14 +2122,14 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     if not rows:
         return ["马", "蛇"]
     
-    # 香港极低衰减：decay=0.06，强调近期数据
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.06)
+    # 微调1：decay 从 0.10 → 0.09（更关注近期）
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.09)
     omission_map = _zodiac_omission_map(rows)
     
-    # 遗漏阈值降为4期（香港冷号反弹周期更短）
-    force_include = [z for z, omit in omission_map.items() if omit >= 4]
+    # 微调2：新增遗漏保护阈值6期（冷号强制候选）
+    force_include = [z for z, omit in omission_map.items() if omit >= 6]
     
-    # 近期热号保护（出现≥2次的不惩罚）
+    # 近期热号保护（保持不变）
     recent_rows = rows[:3]
     recent_zodiac_counts = Counter()
     for r in recent_rows:
@@ -2139,13 +2139,13 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
         recent_zodiac_counts[get_zodiac_by_number(r["special_number"])] += 1
     hot_zodiacs = [z for z, c in recent_zodiac_counts.items() if c >= 2]
     
-    # 特别号生肖惩罚（香港热号惯性弱，惩罚稍重）
+    # 微调3：惩罚从 -0.2 → -0.15（允许热号连续）
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
         if z not in hot_zodiacs:
-            zodiac_scores[z] -= 0.25
+            zodiac_scores[z] -= 0.15
         else:
-            zodiac_scores[z] -= 0.05
+            zodiac_scores[z] -= 0.03
     
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = []
