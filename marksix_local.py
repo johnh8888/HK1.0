@@ -7,18 +7,15 @@ import os
 import re
 import sqlite3
 import time
-import random
 import shutil
 import pickle
 import warnings
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
-from urllib.error import URLError
 
 import numpy as np
 import lightgbm as lgb
@@ -35,7 +32,16 @@ ML_MODEL_KEY = "lightgbm_model"
 
 ALL_NUMBERS = list(range(1, 50))
 
-# ==================== 澳门优化常量（新增） ====================
+# -------------------- 策略标签（扩展后） --------------------
+STRATEGY_LABELS = {
+    "balanced_v1": "组合策略", "hot_v1": "热号策略", "cold_rebound_v1": "冷号回补",
+    "momentum_v1": "近期动量", "ensemble_v2": "集成投票", "pattern_mined_v1": "规律挖掘",
+    "ml_v1": "LightGBM机器学习"
+}
+STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1", "ml_v1"]
+SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1", "ml_v1"]
+
+# -------------------- 澳门优化常量 --------------------
 FEATURE_WINDOW_DEFAULT = 10
 STRATEGY_BASE_WINDOWS = {
     "hot_v1": 6, "momentum_v1": 7, "cold_rebound_v1": 13,
@@ -56,19 +62,9 @@ ZODIAC_MAP = {
     "狗": [9,21,33,45], "鸡": [10,22,34,46], "猴": [11,23,35,47], "羊": [12,24,36,48]
 }
 
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 _WEIGHT_PROTECTION_PRINTED: set[str] = set()
 _PROTECTION_PRINT_COUNTER = 0
-
-# ==================== 原有策略标签扩展 ====================
-STRATEGY_LABELS = {
-    "balanced_v1": "组合策略", "hot_v1": "热号策略", "cold_rebound_v1": "冷号回补",
-    "momentum_v1": "近期动量", "ensemble_v2": "集成投票", "pattern_mined_v1": "规律挖掘",
-    "ml_v1": "LightGBM机器学习"
-}
-STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1", "ml_v1"]
-SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1", "ml_v1"]
-
-PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 
 @dataclass
 class DrawRecord:
@@ -148,7 +144,7 @@ def set_model_state(conn: sqlite3.Connection, key: str, value: str) -> None:
     now = utc_now()
     conn.execute("INSERT INTO model_state(key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
 
-# ==================== 香港数据获取（保持不变） ====================
+# -------------------- 香港数据获取（保持不变） --------------------
 def _parse_date(d: str) -> Optional[str]:
     if not d: return None
     for f in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
@@ -244,7 +240,7 @@ def next_issue(issue_no: str) -> str:
     p = issue_no.split("/")
     return f"{p[0]}/{int(p[1])+1:03d}"
 
-# ==================== 基础特征函数 ====================
+# -------------------- 基础特征与策略（原有 + 增强） --------------------
 def _normalize(m: Dict[int, float]) -> Dict[int, float]:
     vals = list(m.values())
     mn, mx = min(vals), max(vals)
@@ -327,7 +323,7 @@ def _apply_weight_config(draws, config, reason):
     sp, sp_score = cand[0]
     return main_picks, sp, sp_score, scores
 
-# ==================== 偏态检测（强制0.75） ====================
+# -------------------- 偏态检测（强制0.75） --------------------
 def detect_bias(conn, window=10):
     return 0.75, {"forced":True, "zone_bias":0.75, "parity_bias":0.70, "hot_cold_bias":0.70, "zone_dist":[0]*5, "odd_ratio":0.5}
 
@@ -341,7 +337,7 @@ def adjust_weights_for_bias(weights, bias_score):
     total = sum(adj.values())
     return {k: v/total for k,v in adj.items()} if total>0 else adj
 
-# ==================== 生肖辅助函数 ====================
+# -------------------- 生肖辅助函数（澳门优化） --------------------
 def get_zodiac_by_number(n):
     for z, nums in ZODIAC_MAP.items():
         if n in nums: return z
@@ -443,7 +439,7 @@ def get_single_zodiac_pick(conn, issue_no, window=14):
         if cand in two: return cand
     return ranked[0][0]
 
-# ==================== 特别号 v4（含生肖缺失补偿） ====================
+# -------------------- 特别号 v4（含生肖缺失补偿） --------------------
 def _generate_special_number_v4(conn, main_pool, issue_no):
     special_votes = []
     for s in STRATEGY_IDS:
@@ -499,7 +495,7 @@ def _generate_special_number_v4(conn, main_pool, issue_no):
     defenses = [n for n,_ in ranked[1:] if n not in main_set and n!=best][:3]
     return best, round(conf,3), defenses[:3]
 
-# ==================== 集成策略 v3.1 ====================
+# -------------------- 集成策略 v3.1 --------------------
 def _ensemble_strategy_v3_1(draws, mined_config, strategy_weights, conn, issue_no):
     subs = ["hot_v1","cold_rebound_v1","momentum_v1","balanced_v1","pattern_mined_v1"]
     score_maps, sub_picks = [], {}
@@ -538,7 +534,7 @@ def _ensemble_strategy_v3_1(draws, mined_config, strategy_weights, conn, issue_n
     sp, conf, _ = _generate_special_number_v4(conn, main6, issue_no)
     return main_picked, sp, conf, voted
 
-# ==================== ML 模型（保持原香港逻辑） ====================
+# -------------------- ML 模型（保持原香港逻辑） --------------------
 def extract_features_for_number(draws, target):
     recent = draws[:12]
     feats = [1 if any(target in d for d in recent[:lag]) else 0 for lag in [1,2,3,5,8]]
@@ -587,7 +583,7 @@ def ml_strategy(draws, model):
     scores = {n: float(probs[i]) for i, n in enumerate(ALL_NUMBERS)}
     return _apply_weight_config(draws, {"window":6.0, "w_freq":1.0, "w_omit":0.0, "w_mom":0.0}, "LightGBM")
 
-# ==================== 策略调度（增强版） ====================
+# -------------------- 策略调度（增强版） --------------------
 def generate_strategy(draws, strategy, mined_config=None, strategy_weights=None, conn=None, issue_no=None):
     if strategy == "hot_v1": return _apply_weight_config(draws, {"window":6.0, "w_freq":0.78, "w_omit":0.05, "w_mom":0.17}, "热号策略")
     if strategy == "cold_rebound_v1": return _apply_weight_config(draws, {"window":6.0, "w_freq":0.05, "w_omit":0.68, "w_mom":0.27}, "冷号回补")
@@ -605,7 +601,7 @@ def generate_strategy(draws, strategy, mined_config=None, strategy_weights=None,
         return ml_strategy(draws, model)
     return _apply_weight_config(draws, {"window":6.0, "w_freq":0.40, "w_omit":0.30, "w_mom":0.20}, "组合策略")
 
-# ==================== 动态权重与健康度 ====================
+# -------------------- 动态权重与健康度 --------------------
 def get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT):
     rows = conn.execute("""
         SELECT strategy, AVG(main_hit_count) as avg_hit
@@ -664,7 +660,6 @@ def get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT):
         health[s] = {"samples":float(samples), "recent_avg_hit":avg, "hit1_rate":hit1, "hit2_rate":hit2, "cold_streak":float(cold)}
     return health
 
-# ==================== 加权共识池 ====================
 def get_top_special_votes(conn, issue_no, top_n=3):
     all_sp = []
     for s in STRATEGY_IDS:
@@ -743,7 +738,7 @@ def get_picks_for_run(conn, run_id):
     sps = [r["number"] for r in rows if r["pick_type"]=="SPECIAL"]
     return mains, sps[0] if sps else None
 
-# ==================== 智能动态最终推荐（增强版，包含生肖） ====================
+# -------------------- 智能动态最终推荐（包含生肖） --------------------
 _HAS_WARNED_DATA = False
 def get_dynamic_final_recommendation(conn):
     global _HAS_WARNED_DATA
@@ -816,7 +811,60 @@ def print_final_recommendation(conn):
     print(f"  置信度: {conf}/100")
     print("="*70)
 
-# ==================== 主流程函数 ====================
+def get_hot_cold_zodiacs(conn, window=3, top_n=3):
+    rows = conn.execute("SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?", (window,)).fetchall()
+    if len(rows) < window:
+        default = ["马","蛇","龙","兔","虎","牛"]
+        return default[:top_n], default[-top_n:]
+    counter = Counter()
+    for row in rows:
+        nums = json.loads(row["numbers_json"])
+        for n in nums: counter[get_zodiac_by_number(n)] += 1
+        counter[get_zodiac_by_number(row["special_number"])] += 1
+    sorted_freq = sorted(counter.items(), key=lambda x:x[1], reverse=True)
+    hot = [z for z,_ in sorted_freq[:top_n]]
+    cold = [z for z,_ in sorted(counter.items(), key=lambda x:x[1])[:top_n]]
+    return hot, cold
+
+def get_latest_draw(conn):
+    return conn.execute("SELECT issue_no, draw_date, numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
+
+def get_review_stats(conn):
+    return conn.execute("""
+        SELECT strategy, COUNT(*) c, AVG(hit_count) avg_hit, AVG(hit_rate) avg_rate
+        FROM prediction_runs WHERE status='REVIEWED'
+        GROUP BY strategy ORDER BY avg_rate DESC
+    """).fetchall()
+
+def print_dashboard(conn):
+    latest = get_latest_draw(conn)
+    if latest:
+        nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
+        print(f"最新开奖: {latest['issue_no']} {latest['draw_date']} | 主号: {nums} | 特别号: {latest['special_number']:02d}")
+    hot, cold = get_hot_cold_zodiacs(conn, window=3, top_n=3)
+    print(f"最近3期热门生肖: {', '.join(hot)}   |  冷门生肖: {', '.join(cold)}")
+    print_final_recommendation(conn)
+    print("\n📊 各策略历史表现（已复盘）：")
+    stats = get_review_stats(conn)
+    if stats:
+        for s in stats[:7]:
+            name = STRATEGY_LABELS.get(s["strategy"], s["strategy"])
+            print(f"  {name:12s} : 次数={s['c']:3d}  平均命中={float(s['avg_hit']):.2f}  命中率={float(s['avg_rate'])*100:5.2f}%")
+    else:
+        print("  暂无已复盘数据，请先运行：python marksix_local.py fullbacktest")
+
+def send_pushplus_notification(title, content):
+    if not PUSHPLUS_TOKEN: return False
+    import urllib.request, urllib.parse
+    url = "https://www.pushplus.plus/send"
+    data = {"token": PUSHPLUS_TOKEN, "title": title, "content": content, "template": "txt"}
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode()).get("code") == 200
+    except: return False
+
+# -------------------- 主流程函数 --------------------
 def generate_predictions(conn, issue_no=None):
     row = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if not row: raise RuntimeError("没有开奖数据，请先 bootstrap")
@@ -899,7 +947,7 @@ def review_latest(conn):
         return len(runs)
     return 0
 
-# ==================== 命令行（保持原香港功能） ====================
+# -------------------- 命令行 --------------------
 def cmd_bootstrap(args):
     conn = connect_db(args.db); init_db(conn)
     records = fetch_marksix6_records()
@@ -916,11 +964,13 @@ def cmd_sync(args):
 
 def cmd_show(args):
     conn = connect_db(args.db); init_db(conn)
-    latest = conn.execute("SELECT issue_no, draw_date, numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()
-    if latest:
-        nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
-        print(f"最新开奖: {latest['issue_no']} {latest['draw_date']} | 主号: {nums} | 特别号: {latest['special_number']:02d}")
-    print_final_recommendation(conn)
+    print_dashboard(conn)
+    if PUSHPLUS_TOKEN:
+        rec = get_dynamic_final_recommendation(conn)
+        if rec:
+            iss, m6, sp, _, _, _, trio, conf, z1, z2 = rec
+            content = f"【香港六合彩·{iss}期】\n6码: {' '.join(f'{n:02d}' for n in m6)}\n特别号: {sp:02d}\n三中三: {' '.join(f'{n:02d}' for n in trio)}\n1生肖: {z1} 2生肖: {'、'.join(z2)}\n置信度: {conf}/100"
+            send_pushplus_notification(f"香港预测 {iss}", content)
     conn.close()
 
 def cmd_fullbacktest(args):
