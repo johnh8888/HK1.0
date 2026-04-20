@@ -6,6 +6,7 @@ import csv
 import io
 import json
 import os
+import random
 import re
 import socket
 import sqlite3
@@ -33,15 +34,16 @@ MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
 
 # ==================== 【优化后常量】 ====================
-FEATURE_WINDOW_DEFAULT = 10
+FEATURE_WINDOW_DEFAULT = 12  # 从10提高到12，捕捉更长周期
 
 STRATEGY_BASE_WINDOWS = {
-    "hot_v1": 6,
-    "momentum_v1": 7,
-    "cold_rebound_v1": 13,
-    "balanced_v1": 10,
-    "pattern_mined_v1": 6,
-    "ensemble_v2": 10,
+    "hot_v1": 8,
+    "momentum_v1": 9,
+    "cold_rebound_v1": 14,
+    "balanced_v1": 12,
+    "pattern_mined_v1": 8,
+    "ensemble_v2": 12,
+    "hot_cold_mix_v1": 10,   # 新增热冷混合策略
 }
 
 WEIGHT_WINDOW_DEFAULT = 30
@@ -63,11 +65,28 @@ STRATEGY_LABELS = {
     "momentum_v1": "近期动量",
     "ensemble_v2": "集成投票",
     "pattern_mined_v1": "规律挖掘",
+    "hot_cold_mix_v1": "热冷混合",  # 新增
 }
-STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
-SPECIAL_ANALYSIS_ORDER = ["pattern_mined_v1", "ensemble_v2", "momentum_v1", "cold_rebound_v1", "hot_v1", "balanced_v1"]
+STRATEGY_IDS = [
+    "balanced_v1",
+    "hot_v1",
+    "cold_rebound_v1",
+    "momentum_v1",
+    "ensemble_v2",
+    "pattern_mined_v1",
+    "hot_cold_mix_v1",  # 新增
+]
+SPECIAL_ANALYSIS_ORDER = [
+    "pattern_mined_v1",
+    "ensemble_v2",
+    "momentum_v1",
+    "cold_rebound_v1",
+    "hot_v1",
+    "balanced_v1",
+    "hot_cold_mix_v1",
+]
 
-# 生肖映射（正确版本：1=马，2=蛇，3=龙，4=兔，5=虎，6=牛，7=鼠，8=猪，9=狗，10=鸡，11=猴，12=羊）
+# 生肖映射
 ZODIAC_MAP = {
     "马": [1, 13, 25, 37, 49],
     "蛇": [2, 14, 26, 38],
@@ -83,7 +102,6 @@ ZODIAC_MAP = {
     "羊": [12, 24, 36, 48],
 }
 
-# PushPlus 配置
 PUSHPLUS_TOKEN = ""
 if os.environ.get("PUSHPLUS_TOKEN"):
     PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
@@ -382,7 +400,6 @@ def parse_draw_csv_text(csv_text: str) -> List[DrawRecord]:
     return sorted(dedup.values(), key=lambda r: (r.draw_date, r.issue_no))
 
 
-# ========== 香港数据获取（修改处） ==========
 def parse_hk_from_marksix6_api(payload: dict) -> List[DrawRecord]:
     records: List[DrawRecord] = []
     lottery_list = payload.get("lottery_data", [])
@@ -502,8 +519,6 @@ def fetch_hk_records(
         f"请稍后重试，或检查网络/目标站点可用性。last_error={last_error}"
     )
 
-
-# ========== 以下内容与澳门脚本完全一致（仅数据源调用改为 fetch_hk_records） ==========
 
 def upsert_draw(conn: sqlite3.Connection, record: DrawRecord, source: str) -> str:
     now = utc_now()
@@ -693,7 +708,10 @@ def _zone_heat_map(draws: List[List[int]], window: int = 3) -> Dict[int, float]:
     return {n: zone_score[min(4, (n - 1) // 10)] for n in ALL_NUMBERS}
 
 
-def _pick_top_six(scores: Dict[int, float], reason: str) -> List[Tuple[int, int, float, str]]:
+def _pick_top_six_optimized(scores: Dict[int, float], reason: str) -> List[Tuple[int, int, float, str]]:
+    """
+    优化版6码筛选：放宽奇偶比、区间、和值约束。
+    """
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     picked: List[Tuple[int, float]] = []
     for n, s in ranked:
@@ -701,25 +719,34 @@ def _pick_top_six(scores: Dict[int, float], reason: str) -> List[Tuple[int, int,
             break
         proposal = [pn for pn, _ in picked] + [n]
         odd_count = sum(1 for x in proposal if x % 2 == 1)
-        if len(proposal) >= 4 and (odd_count == 0 or odd_count == len(proposal)):
+
+        # 放宽奇偶比：禁止5个及以上同奇偶，而不是4个
+        if len(proposal) >= 5 and (odd_count == 0 or odd_count == len(proposal)):
             continue
+
+        # 区间约束：禁止同一区间≥5个
         zone_counts: Dict[int, int] = {}
         for x in proposal:
             z = min(4, (x - 1) // 10)
             zone_counts[z] = zone_counts.get(z, 0) + 1
-        if any(c >= 4 for c in zone_counts.values()):
+        if any(c >= 5 for c in zone_counts.values()):
             continue
+
         picked.append((n, s))
+
+    # 补充不足6个（理论上不会，但以防万一）
     while len(picked) < 6:
         for n, s in ranked:
             if n not in [pn for pn, _ in picked]:
                 picked.append((n, s))
                 break
 
-    target_low, target_high = 95, 205
+    # 和值范围放宽至 80~220
+    target_low, target_high = 80, 220
     top6 = [n for n, _ in picked[:6]]
     total = sum(top6)
     if not (target_low <= total <= target_high):
+        # 尝试替换一个号码
         for i in range(5, -1, -1):
             replaced = False
             for alt_n, alt_s in ranked:
@@ -817,7 +844,7 @@ def _apply_weight_config(
             + zone[n] * w_zone
         )
 
-    main_picks = _pick_top_six(scores, reason)
+    main_picks = _pick_top_six_optimized(scores, reason)
     main_set = {n for n, _, _, _ in main_picks}
     special_candidates = [(n, s) for n, s in sorted(scores.items(), key=lambda x: x[1], reverse=True) if n not in main_set]
     if not special_candidates:
@@ -956,17 +983,16 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     cold_streak = int(h.get("cold_streak", 0))
 
     if recent_avg >= 0.95:
-        return max(5, base - 2)
+        return max(6, base - 2)
     elif recent_avg >= 0.80:
-        return max(6, base - 1)
+        return max(7, base - 1)
     elif recent_avg <= 0.55 or cold_streak >= 4:
-        return min(15, base + 3)
+        return min(16, base + 3)
     elif recent_avg <= 0.65:
-        return min(13, base + 2)
+        return min(14, base + 2)
     return base
 
 
-# ========== 偏态检测函数（强制偏态模式） ==========
 def detect_bias(conn: sqlite3.Connection, window: int = 10) -> Tuple[float, Dict[str, float]]:
     """强制偏态模式：固定偏态系数 0.75"""
     return 0.75, {
@@ -993,7 +1019,6 @@ def adjust_weights_for_bias(weights: Dict[str, float], bias_score: float) -> Dic
     return adjusted
 
 
-# ========== 特别号 v4 增强版 ==========
 def _generate_special_number_v4(
     conn: sqlite3.Connection,
     main_pool: List[int],
@@ -1093,7 +1118,6 @@ def _generate_special_number_v4(
     return best, round(confidence, 3), defenses[:3]
 
 
-# ========== 三中三优化版 v2 ==========
 def get_trio_from_merged_pool20_v2(conn: sqlite3.Connection, issue_no: str) -> List[int]:
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     if not pool20 or len(pool20) < 3:
@@ -1157,7 +1181,6 @@ def get_trio_from_merged_pool20_v2(conn: sqlite3.Connection, issue_no: str) -> L
     return candidates[:3] if len(candidates) >= 3 else pool20[:3]
 
 
-# ========== 集成策略 v3.1 ==========
 def _ensemble_strategy_v3_1(
     draws: List[List[int]],
     mined_config: Optional[Dict[str, float]],
@@ -1165,13 +1188,13 @@ def _ensemble_strategy_v3_1(
     conn: sqlite3.Connection,
     issue_no: str
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
+    sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1", "hot_cold_mix_v1"]
     score_maps = []
     sub_picks = {}
-    
+
     bias_score, _ = detect_bias(conn, window=10)
     adjusted_weights = adjust_weights_for_bias(strategy_weights, bias_score)
-    
+
     if bias_score > BIAS_THRESHOLD:
         print(f"[集成策略] 🔥 偏态模式激活，偏态系数={bias_score:.2f} 🔥", flush=True)
         cold_weight = adjusted_weights.get("cold_rebound_v1", 0.0)
@@ -1187,6 +1210,15 @@ def _ensemble_strategy_v3_1(
             cfg = mined_config or _default_mined_config()
             cfg["window"] = float(win_size)
             _, _, _, score_map = _apply_weight_config(sub_draws, cfg, "规律挖掘")
+        elif sub == "hot_cold_mix_v1":
+            # 热冷混合策略：分别计算热号和冷号得分，各取前50%加权融合
+            hot_config = {"window": float(win_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17}
+            cold_config = {"window": float(win_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27}
+            _, _, _, hot_scores = _apply_weight_config(sub_draws, hot_config, "热号")
+            _, _, _, cold_scores = _apply_weight_config(sub_draws, cold_config, "冷号")
+            hot_norm = _normalize(hot_scores)
+            cold_norm = _normalize(cold_scores)
+            score_map = {n: 0.5 * hot_norm[n] + 0.5 * cold_norm[n] for n in ALL_NUMBERS}
         else:
             config = {"window": float(win_size)}
             if sub == "hot_v1":
@@ -1195,8 +1227,8 @@ def _ensemble_strategy_v3_1(
                 config.update({"w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27})
             elif sub == "momentum_v1":
                 config.update({"w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83})
-            else:
-                config.update({"w_freq": 0.40, "w_omit": 0.30, "w_mom": 0.20})
+            else:  # balanced_v1 提高遗漏权重
+                config.update({"w_freq": 0.30, "w_omit": 0.40, "w_mom": 0.20, "w_pair": 0.05, "w_zone": 0.05})
             _, _, _, score_map = _apply_weight_config(sub_draws, config, STRATEGY_LABELS.get(sub, sub))
 
         score_maps.append(score_map)
@@ -1210,12 +1242,18 @@ def _ensemble_strategy_v3_1(
         for rank, (n, _) in enumerate(ranked):
             votes[n] += w * (49 - rank)
 
+    # 加入小随机扰动打破同质化（固定种子保证可复现）
+    seed_val = int(issue_no.replace('/', '')) if issue_no else 42
+    random.seed(seed_val)
+    for n in ALL_NUMBERS:
+        votes[n] += random.uniform(-0.3, 0.3)
+
     for n in ALL_NUMBERS:
         appear = sum(1 for p in sub_picks.values() if n in p)
         votes[n] += (6 - appear) * ENSEMBLE_DIVERSITY_BONUS * 1.2
 
     voted = _normalize(votes)
-    main_picked = _pick_top_six(voted, "集成投票v3.1")
+    main_picked = _pick_top_six_optimized(voted, "集成投票v3.1")
 
     main6 = [n for n, _, _, _ in main_picked]
     special_number, confidence, _ = _generate_special_number_v4(conn, main6, issue_no)
@@ -1258,8 +1296,8 @@ def generate_strategy(
             strategy_draws,
             {
                 "window": float(window_size),
-                "w_freq": 0.40,
-                "w_omit": 0.30,
+                "w_freq": 0.30,
+                "w_omit": 0.40,   # 提高遗漏权重
                 "w_mom": 0.20,
                 "w_pair": 0.05,
                 "w_zone": 0.05,
@@ -1270,6 +1308,20 @@ def generate_strategy(
         cfg = mined_config or _default_mined_config()
         cfg["window"] = float(window_size)
         return _apply_weight_config(strategy_draws, cfg, "规律挖掘")
+    elif strategy == "hot_cold_mix_v1":
+        # 热冷混合
+        hot_config = {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17}
+        cold_config = {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27}
+        _, _, _, hot_scores = _apply_weight_config(strategy_draws, hot_config, "热号")
+        _, _, _, cold_scores = _apply_weight_config(strategy_draws, cold_config, "冷号")
+        hot_norm = _normalize(hot_scores)
+        cold_norm = _normalize(cold_scores)
+        mixed_scores = {n: 0.5 * hot_norm[n] + 0.5 * cold_norm[n] for n in ALL_NUMBERS}
+        main_picked = _pick_top_six_optimized(mixed_scores, "热冷混合")
+        special_candidates = sorted(mixed_scores.items(), key=lambda x: x[1], reverse=True)
+        main_set = {n for n, _, _, _ in main_picked}
+        special = next((n for n, _ in special_candidates if n not in main_set), special_candidates[0][0])
+        return main_picked, special, 0.0, mixed_scores
     elif strategy in ("ensemble_v2", "ensemble_v3"):
         if strategy_weights is None:
             strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT) if conn else {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
@@ -1279,6 +1331,7 @@ def generate_strategy(
             raise ValueError("ensemble_v2/v3 requires issue_no parameter")
         return _ensemble_strategy_v3_1(strategy_draws, mined_config, strategy_weights, conn, issue_no)
 
+    # fallback
     return _apply_weight_config(
         strategy_draws,
         {
@@ -1802,7 +1855,6 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
-# ========== 动态权重相关函数 ==========
 def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
     rows = conn.execute("""
         SELECT strategy, AVG(main_hit_count) as avg_hit
@@ -1831,16 +1883,17 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
         hit1_rate = float(h.get("hit1_rate", 0.0))
         cold_streak = int(h.get("cold_streak", 0))
 
+        # 平滑衰减（降低敏感度）
         shrink = 1.0
         if recent_avg < 0.7:
-            shrink *= 0.90 ** ((0.7 - recent_avg) * 8)
+            shrink *= 0.95 ** ((0.7 - recent_avg) * 5)
         if hit1_rate < 0.52:
-            shrink *= 0.87
+            shrink *= 0.92
         if cold_streak >= 3:
-            shrink *= 0.72
+            shrink *= 0.80
 
         if strategy == "pattern_mined_v1" and (cold_streak >= 2 or recent_avg < 0.6):
-            shrink *= 0.48
+            shrink *= 0.60
             protection_msgs.append(f"[保护] 规律挖掘连挂 {cold_streak} 期，权重大幅下调")
 
         weights[strategy] = max(0.08, weights[strategy] * shrink)
@@ -1920,7 +1973,6 @@ def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DE
     return health
 
 
-# ========== 生肖相关函数（优化版） ==========
 def get_zodiac_by_number(number: int) -> str:
     for zodiac, nums in ZODIAC_MAP.items():
         if number in nums:
@@ -1928,7 +1980,6 @@ def get_zodiac_by_number(number: int) -> str:
     return "马"
 
 def _get_previous_issue(conn: sqlite3.Connection, current_issue: str) -> Optional[str]:
-    """获取当前期号的上一期"""
     row = conn.execute(
         """
         SELECT issue_no FROM draws 
@@ -1942,7 +1993,6 @@ def _get_previous_issue(conn: sqlite3.Connection, current_issue: str) -> Optiona
     return row["issue_no"] if row else None
 
 def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
-    """检查指定期号的双生肖推荐是否命中"""
     draw = conn.execute(
         "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
         (issue_no,)
@@ -1975,7 +2025,6 @@ def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
     return any(z in winning_zodiacs for z in picks)
 
 def _zodiac_omission_map(rows: Sequence[sqlite3.Row]) -> Dict[str, int]:
-    """计算每个生肖最近一次出现的期数距离（遗漏值）"""
     zodiac_omission = {z: len(rows) + 1 for z in ZODIAC_MAP.keys()}
     for i, row in enumerate(rows):
         numbers = json.loads(row["numbers_json"])
@@ -2121,15 +2170,9 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
 def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     if not rows:
         return ["马", "蛇"]
-    
-    # 香港极低衰减：decay=0.06，强调近期数据
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.06)
     omission_map = _zodiac_omission_map(rows)
-    
-    # 遗漏阈值降为4期（香港冷号反弹周期更短）
     force_include = [z for z, omit in omission_map.items() if omit >= 4]
-    
-    # 近期热号保护（出现≥2次的不惩罚）
     recent_rows = rows[:3]
     recent_zodiac_counts = Counter()
     for r in recent_rows:
@@ -2138,15 +2181,12 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
             recent_zodiac_counts[get_zodiac_by_number(n)] += 1
         recent_zodiac_counts[get_zodiac_by_number(r["special_number"])] += 1
     hot_zodiacs = [z for z, c in recent_zodiac_counts.items() if c >= 2]
-    
-    # 特别号生肖惩罚（香港热号惯性弱，惩罚稍重）
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
         if z not in hot_zodiacs:
             zodiac_scores[z] -= 0.25
         else:
             zodiac_scores[z] -= 0.05
-    
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = []
     for z in force_include:
@@ -2166,34 +2206,22 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     if not rows:
         return two_zodiac[0] if two_zodiac else "马"
 
-    # 极低衰减：decay=0.04
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.04)
     omission_map = _zodiac_omission_map(rows)
-    
-    # 遗漏加分强化（上限6.0，系数1.0）
     for z in zodiac_scores:
         omit = omission_map.get(z, len(rows))
         zodiac_scores[z] += min(6.0, omit * 1.0)
-    
-    # 最冷生肖固定加分5.0
     coldest_zodiac = max(omission_map.keys(), key=lambda z: omission_map[z])
     zodiac_scores[coldest_zodiac] += 5.0
-    
-    # 近期特别号频率加分（提升至1.2）
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:5]]
     special_counter = Counter(recent_special_zodiacs)
     for z, cnt in special_counter.most_common(3):
         zodiac_scores[z] += cnt * 1.2
-    
-    # 近期特别号惩罚稍重（-0.2）
     recent_sp_zod = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_sp_zod:
         zodiac_scores[z] -= 0.2
-    
-    # 双生肖绑定加分4.0
     for z in two_zodiac:
         zodiac_scores[z] += 4.0
-    
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     for candidate, _ in ranked:
         if candidate in two_zodiac:
@@ -2277,7 +2305,7 @@ def get_recent_two_zodiac_report(
         "max_miss_streak": float(max_miss_streak),
     }
 
-# ========== 特别号投票 ==========
+
 def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 3) -> List[int]:
     all_specials = []
     for strategy in STRATEGY_IDS:
@@ -2443,12 +2471,10 @@ def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[
     return main6, pool10, pool14, pool20, special
 
 
-# ========== 三中三入口 ==========
 def get_trio_from_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
     return get_trio_from_merged_pool20_v2(conn, issue_no)
 
 
-# ========== 最终推荐函数 ==========
 def get_final_recommendation(conn: sqlite3.Connection):
     row = conn.execute(
         "SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1"
@@ -2708,7 +2734,6 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             send_pushplus_notification(f"香港六合彩预测 {issue_no}", content)
 
 
-# ========== 命令行函数 ==========
 def cmd_bootstrap(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
@@ -2814,7 +2839,7 @@ def cmd_mine(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="香港六合彩预测工具 - v4全面优化版（与澳门功能一致）")
+    p = argparse.ArgumentParser(description="香港六合彩预测工具 - 优化版（放宽约束/新增策略/平滑权重）")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
