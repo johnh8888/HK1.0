@@ -46,8 +46,8 @@ STRATEGY_BASE_WINDOWS = {
     "hot_cold_mix_v1": 10,   # 新增热冷混合策略
 }
 
-WEIGHT_WINDOW_DEFAULT = 30
-HEALTH_WINDOW_DEFAULT = 18
+WEIGHT_WINDOW_DEFAULT = 12
+HEALTH_WINDOW_DEFAULT = 10
 BACKTEST_ISSUES_DEFAULT = 120
 
 # Ensemble v3.1 配置
@@ -1856,6 +1856,9 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 
 
 def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
+    # 优化：使用更短且更具响应性的动态窗口（默认为12期）
+    adaptive_window = min(window, 12)  # 限制最大窗口为12，提高敏捷性
+    
     rows = conn.execute("""
         SELECT strategy, AVG(main_hit_count) as avg_hit
         FROM strategy_performance
@@ -1863,53 +1866,52 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
             SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?
         )
         GROUP BY strategy
-    """, (window,)).fetchall()
+    """, (adaptive_window,)).fetchall()
 
-    baseline = 0.6
+    # 基线命中率（期望值）
+    baseline = 0.65
+    
+    # 初始权重（基于历史平均命中）
     weights = {s: baseline for s in STRATEGY_IDS}
-    protection_msgs: List[str] = []
-
     for r in rows:
         strategy = str(r["strategy"])
         avg_hit = float(r["avg_hit"] or 0.0)
         if strategy in weights:
             weights[strategy] = max(avg_hit, baseline)
 
-    health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
+    # 获取近期健康度（使用更短的健康窗口，原HEALTH_WINDOW_DEFAULT=18，现调整为10）
+    health_window = min(10, adaptive_window)
+    health = get_strategy_health(conn, window=health_window)
+
+    # 权重微调：温和衰减 + 回升奖励
     for strategy, h in health.items():
         if strategy not in weights:
             continue
+        
         recent_avg = float(h.get("recent_avg_hit", 0.0))
         hit1_rate = float(h.get("hit1_rate", 0.0))
         cold_streak = int(h.get("cold_streak", 0))
 
-        # 平滑衰减（降低敏感度）
+        # 基础衰减因子（比原版温和）
         shrink = 1.0
-        if recent_avg < 0.7:
-            shrink *= 0.95 ** ((0.7 - recent_avg) * 5)
-        if hit1_rate < 0.52:
-            shrink *= 0.92
-        if cold_streak >= 3:
-            shrink *= 0.80
+        if recent_avg < 0.60:
+            shrink *= 0.97 ** ((0.60 - recent_avg) * 5)
+        if hit1_rate < 0.45:
+            shrink *= 0.95
+        if cold_streak >= 4:
+            shrink *= 0.88
 
-        if strategy == "pattern_mined_v1" and (cold_streak >= 2 or recent_avg < 0.6):
-            shrink *= 0.60
-            protection_msgs.append(f"[保护] 规律挖掘连挂 {cold_streak} 期，权重大幅下调")
+        # 回升奖励：若近期命中率显著高于历史均值，给予权重加成
+        hist_avg = weights.get(strategy, baseline)
+        if recent_avg > hist_avg + 0.2 and cold_streak == 0:
+            shrink *= 1.08  # 小幅提升
 
-        weights[strategy] = max(0.08, weights[strategy] * shrink)
+        # 应用调整，并保证最低权重不低于0.05（防止完全淘汰）
+        weights[strategy] = max(0.05, weights[strategy] * shrink)
 
+    # 归一化并返回
     total = sum(weights.values())
-    global _PROTECTION_PRINT_COUNTER
-    for msg in protection_msgs:
-        if msg not in _WEIGHT_PROTECTION_PRINTED:
-            print(msg, flush=True)
-            _WEIGHT_PROTECTION_PRINTED.add(msg)
-    if protection_msgs:
-        _PROTECTION_PRINT_COUNTER += 1
-        if _PROTECTION_PRINT_COUNTER % 20 == 0:
-            print(f"[保护] 当前规律挖掘/冷号回补仍处于权重保护中 (已持续{_PROTECTION_PRINT_COUNTER}期)", flush=True)
     return {k: round(v / total, 4) for k, v in weights.items()}
-
 
 def get_trio_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Tuple[float, float, float]:
     rows = conn.execute("""
