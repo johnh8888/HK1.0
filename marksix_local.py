@@ -1856,8 +1856,8 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 
 
 def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
-    # 优化：使用更短且更具响应性的动态窗口（默认为12期）
-    adaptive_window = min(window, 12)  # 限制最大窗口为12，提高敏捷性
+    # 动态窗口（最长12期，保持敏捷）
+    adaptive_window = min(window, 12)
     
     rows = conn.execute("""
         SELECT strategy, AVG(main_hit_count) as avg_hit
@@ -1868,10 +1868,7 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
         GROUP BY strategy
     """, (adaptive_window,)).fetchall()
 
-    # 基线命中率（期望值）
     baseline = 0.65
-    
-    # 初始权重（基于历史平均命中）
     weights = {s: baseline for s in STRATEGY_IDS}
     for r in rows:
         strategy = str(r["strategy"])
@@ -1879,11 +1876,9 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
         if strategy in weights:
             weights[strategy] = max(avg_hit, baseline)
 
-    # 获取近期健康度（使用更短的健康窗口，原HEALTH_WINDOW_DEFAULT=18，现调整为10）
     health_window = min(10, adaptive_window)
     health = get_strategy_health(conn, window=health_window)
 
-    # 权重微调：温和衰减 + 回升奖励
     for strategy, h in health.items():
         if strategy not in weights:
             continue
@@ -1892,8 +1887,8 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
         hit1_rate = float(h.get("hit1_rate", 0.0))
         cold_streak = int(h.get("cold_streak", 0))
 
-        # 基础衰减因子（比原版温和）
         shrink = 1.0
+        # 温和衰减
         if recent_avg < 0.60:
             shrink *= 0.97 ** ((0.60 - recent_avg) * 5)
         if hit1_rate < 0.45:
@@ -1901,15 +1896,25 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
         if cold_streak >= 4:
             shrink *= 0.88
 
-        # 回升奖励：若近期命中率显著高于历史均值，给予权重加成
+        # 过热降温：近期均值超过历史均值+0.3，且连挂=0，小幅回调
         hist_avg = weights.get(strategy, baseline)
+        if recent_avg > hist_avg + 0.3 and cold_streak == 0:
+            shrink *= 0.96
+
+        # 回升奖励
         if recent_avg > hist_avg + 0.2 and cold_streak == 0:
-            shrink *= 1.08  # 小幅提升
+            shrink *= 1.08
 
-        # 应用调整，并保证最低权重不低于0.05（防止完全淘汰）
-        weights[strategy] = max(0.05, weights[strategy] * shrink)
+        weights[strategy] = weights[strategy] * shrink
 
-    # 归一化并返回
+    # 冷号回补特殊保护：最低权重不低于0.08
+    if "cold_rebound_v1" in weights:
+        weights["cold_rebound_v1"] = max(0.08, weights["cold_rebound_v1"])
+    # 其他策略最低0.05
+    for s in weights:
+        if s != "cold_rebound_v1":
+            weights[s] = max(0.05, weights[s])
+
     total = sum(weights.values())
     return {k: round(v / total, 4) for k, v in weights.items()}
 
