@@ -1025,20 +1025,19 @@ def _generate_special_number_v4(
     issue_no: str
 ) -> Tuple[int, float, List[int]]:
     """
-    特别号生成增强版 v4.2
-    - 策略加权投票（近期动量权重大幅提升至1.8）
-    - 长期遗漏特别号强力回补（系数增强）
-    - 主号与特别号同尾、邻号、同生肖关联加分（权重提高）
-    - 生肖周期冷热预测
-    - 尾数冷热分析（新增特别号尾数遗漏加分）
-    - 奇偶趋势反向选择
+    特别号生成终极增强版 v5.0
+    - 同尾、邻号加分大幅提升
+    - 长期遗漏特别号回补上限提高至12.0
+    - 近期动量策略权重提升至2.2
+    - 新增号码段偏好（25-49区间额外加分）
+    - 防守号智能生成：强制包含同尾和邻号候选
     """
     special_votes = []
     vote_weights = {}
     
-    # 各策略特别号权重系数（基于历史命中率表现，近期动量一骑绝尘）
+    # 策略权重（近期动量策略遥遥领先）
     strategy_special_weights = {
-        "momentum_v1": 1.8,      # 提升至1.8
+        "momentum_v1": 2.2,
         "hot_cold_mix_v1": 1.2,
         "ensemble_v2": 1.1,
         "hot_v1": 1.0,
@@ -1058,25 +1057,26 @@ def _generate_special_number_v4(
                 special_votes.append(sp)
                 vote_weights[sp] = vote_weights.get(sp, 0.0) + strategy_special_weights.get(strategy, 1.0)
 
-    # 最近60期特别号遗漏计算
+    # 最近80期特别号（扩大历史范围以捕捉长期遗漏）
     recent_specials = [int(r["special_number"]) for r in conn.execute(
-        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 60"
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 80"
     ).fetchall()]
-    omission = {n: 60 for n in ALL_NUMBERS}
+    
+    omission = {n: 80 for n in ALL_NUMBERS}
     for i, num in enumerate(recent_specials):
-        omission[num] = min(omission.get(num, 60), i + 1)
+        omission[num] = min(omission.get(num, 80), i + 1)
 
-    # 生肖冷热分析（最近24期）
+    # 生肖冷热（最近24期）
     zodiac_cycle = [get_zodiac_by_number(sp) for sp in recent_specials[:24]]
     zodiac_counter = Counter(zodiac_cycle)
     least_zodiac = min(zodiac_counter, key=lambda z: zodiac_counter[z], default="马")
     predicted_zodiac_numbers = ZODIAC_MAP.get(least_zodiac, [1, 13, 25, 37, 49])
 
-    # 尾数冷热分析（最近20期）
+    # 尾数冷热
     tail_counter = Counter([n % 10 for n in recent_specials[:20]])
     coldest_tail = min(tail_counter, key=lambda t: tail_counter[t], default=0)
     
-    # 特别号尾数遗漏计算（独立于号码遗漏）
+    # 尾数遗漏
     tail_omission = {t: 20 for t in range(10)}
     for i, sp in enumerate(recent_specials[:20]):
         tail_omission[sp % 10] = min(tail_omission.get(sp % 10, 20), i + 1)
@@ -1091,80 +1091,97 @@ def _generate_special_number_v4(
             
         score = 0.0
         
-        # 1. 加权投票得分
+        # 1. 加权投票
         score += vote_weights.get(n, 0) * 5.0
         
-        # 2. 遗漏值加分（长期未出特别号强力回补）
-        omit_val = omission.get(n, 60)
-        if omit_val >= 20:
-            score += min(8.0, omit_val / 4.0)   # 强化
-        elif omit_val >= 10:
-            score += omit_val / 3.5
+        # 2. 遗漏回补（强化版）
+        omit_val = omission.get(n, 80)
+        if omit_val >= 25:
+            score += min(12.0, omit_val / 3.5)
+        elif omit_val >= 15:
+            score += omit_val / 3.0
+        elif omit_val >= 8:
+            score += omit_val / 5.0
         else:
-            score += omit_val / 7.0
+            score += omit_val / 8.0
         
-        # 3. 规避最近3期特别号
-        if n in recent_specials[:3]:
-            score *= 0.25
-        elif n in recent_specials[3:6]:
-            score *= 0.55
+        # 3. 规避最近2期特别号（更严格）
+        if n in recent_specials[:2]:
+            score *= 0.15
+        elif n in recent_specials[2:4]:
+            score *= 0.4
+        elif n in recent_specials[4:6]:
+            score *= 0.6
         
-        # 4. 生肖预测加分
+        # 4. 生肖预测
         if n in predicted_zodiac_numbers:
+            score += 3.0
+        
+        # 5. 尾数冷热
+        if n % 10 == coldest_tail:
+            score += 2.8
+        if n % 10 == coldest_tail_by_omit:
             score += 2.8
         
-        # 5. 尾数冷态加分（号码尾数+特别号尾数遗漏双重加分）
-        if n % 10 == coldest_tail:
-            score += 2.5
-        if n % 10 == coldest_tail_by_omit:
-            score += 2.5
+        # 6. 号码段偏好（特别号在25-49区间占比更高）
+        if 25 <= n <= 49:
+            score += 2.0
         
-        # 6. 与主号的关联特征（强化同尾、邻号）
+        # 7. 与主号的关联特征（超强版）
         for mn in main_pool:
-            # 同尾
-            if n % 10 == mn % 10:
-                score += 3.5   # 大幅提升
-            # 邻号
+            if n % 10 == mn % 10:      # 同尾
+                score += 5.0
             diff = abs(n - mn)
-            if diff == 1:
-                score += 3.8   # 大幅提升
+            if diff == 1:              # 邻号+1
+                score += 5.5
             elif diff == 2:
-                score += 2.2
+                score += 2.8
             elif diff == 3:
-                score += 1.4
-            # 同生肖
-            if get_zodiac_by_number(n) == get_zodiac_by_number(mn):
                 score += 1.8
+            if get_zodiac_by_number(n) == get_zodiac_by_number(mn):
+                score += 2.2
         
-        # 7. 特别号奇偶趋势反向选择
+        # 8. 奇偶趋势
         recent_parity = [sp % 2 for sp in recent_specials[:8]]
         if len(recent_parity) >= 5:
             odd_ratio = sum(recent_parity) / len(recent_parity)
-            if odd_ratio > 0.65 and n % 2 == 0:
-                score += 2.0
-            elif odd_ratio < 0.35 and n % 2 == 1:
-                score += 2.0
+            if odd_ratio > 0.7 and n % 2 == 0:
+                score += 2.2
+            elif odd_ratio < 0.3 and n % 2 == 1:
+                score += 2.2
         
         scores[n] = score
 
     # 按得分排序
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     best = ranked[0][0]
-    confidence = min(1.0, ranked[0][1] / 30.0)  # 调整归一化分母
+    confidence = min(1.0, ranked[0][1] / 35.0)
     
-    # 生成防守号码（不与主号冲突，且尽量与主号不同尾）
+    # 防守号生成：强制包含一个同尾、一个邻号
     defenses = []
     main_tails = {mn % 10 for mn in main_pool}
+    
+    # 优先选一个与主号同尾且未在主池中的号码作为防守1
     for n, s in ranked[1:]:
         if n not in main_set and n != best:
-            # 优先选择与主号尾数不同的防守号（增加多样性）
-            if len(defenses) < 2 and (n % 10) in main_tails:
-                continue  # 跳过同尾过多的候选
+            if any(n % 10 == mn % 10 for mn in main_pool):
+                defenses.append(n)
+                break
+    
+    # 再选一个与主号差1的邻号
+    for n, s in ranked[1:]:
+        if n not in main_set and n != best and n not in defenses:
+            if any(abs(n - mn) == 1 for mn in main_pool):
+                defenses.append(n)
+                break
+    
+    # 补充剩余防守号
+    for n, s in ranked[1:]:
+        if n not in main_set and n != best and n not in defenses:
             defenses.append(n)
             if len(defenses) >= 3:
                 break
     
-    # 补足防守号
     while len(defenses) < 3:
         for n, s in ranked:
             if n not in defenses and n != best and n not in main_set:
