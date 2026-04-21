@@ -31,6 +31,8 @@ API_RETRIES_DEFAULT = 4
 API_RETRY_BACKOFF_SECONDS = 2.0
 
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
+TRIO3_METHOD_STATE_KEY = "trio3_best_methods_v1"
+SPECIAL1_METHOD_STATE_KEY = "special1_best_methods_v1"
 ALL_NUMBERS = list(range(1, 50))
 
 # ==================== 【优化后常量】 ====================
@@ -65,6 +67,15 @@ PHYSICAL_BIAS_SCORE_WEIGHT = 0.08  # applied as additive score term (gated)
 
 MICRO_PATTERN_WINDOW_DEFAULT = 4
 MICRO_PATTERN_SCORE_WEIGHT = 0.05
+
+# 覆盖型推荐（用于提高“三中三/特别号”命中率：输出候选池而非单点）
+TRIO_TICKETS_DEFAULT = 20          # 输出多少组三中三组合（任一组全中算命中）
+SPECIAL_POOL_TOPN_DEFAULT = 20     # 输出多少个特别号候选（命中判定：落在池内）
+
+# 单组“三中三 3码”与“特别号单点”（用于输出最强/次强）
+TRIO3_SIZE_DEFAULT = 3
+SPECIAL_CANDIDATES_DEFAULT = 5
+TEXIAO4_SIZE_DEFAULT = 4
 
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
@@ -985,6 +996,338 @@ def _pool_hit_count(pool_numbers: Sequence[int], winning: set[int]) -> int:
     return len([n for n in pool_numbers if n in winning])
 
 
+def _pick_topk_unique(items: Sequence[int], k: int) -> List[int]:
+    out: List[int] = []
+    for x in items:
+        xi = int(x)
+        if xi not in out:
+            out.append(xi)
+        if len(out) >= k:
+            break
+    return out
+
+
+def get_special_candidate_pool(
+    conn: sqlite3.Connection,
+    issue_no: str,
+    main6: Sequence[int],
+    pool20: Sequence[int],
+    topn: int = SPECIAL_POOL_TOPN_DEFAULT,
+    status: str = "PENDING",
+) -> List[int]:
+    """
+    覆盖型特别号候选池：优先用策略投票 + 防守号，再用20码池补齐。
+    """
+    mains = {int(x) for x in main6}
+    # 策略投票（更多候选）
+    top_votes = get_top_special_votes(conn, issue_no, top_n=max(12, int(topn)), status=status)
+    primary, defenses, _conflict = get_special_recommendation(conn, issue_no, main6, status=status)
+    ordered: List[int] = []
+    if primary is not None:
+        ordered.append(int(primary))
+    ordered.extend(int(x) for x in defenses)
+    ordered.extend(int(x) for x in top_votes)
+    # 用20码池补齐（避开主号）
+    for n in pool20:
+        ni = int(n)
+        if ni in mains:
+            continue
+        ordered.append(ni)
+    # 最后兜底：全号码补齐
+    for n in ALL_NUMBERS:
+        if n in mains:
+            continue
+        ordered.append(n)
+    return _pick_topk_unique([n for n in ordered if 1 <= int(n) <= 49 and int(n) not in mains], int(topn))
+
+
+def _diverse_topk_from_pool20(pool20: Sequence[int], k: int = 5) -> List[int]:
+    ranked = [int(x) for x in pool20 if 1 <= int(x) <= 49]
+    if not ranked:
+        return []
+    picked: List[int] = []
+    zone_counts: Dict[int, int] = {}
+    for n in ranked:
+        if n in picked:
+            continue
+        z = _zone_of(n)
+        if zone_counts.get(z, 0) >= 2:
+            continue
+        picked.append(n)
+        zone_counts[z] = zone_counts.get(z, 0) + 1
+        if len(picked) >= k:
+            break
+    for n in ranked:
+        if len(picked) >= k:
+            break
+        if n not in picked:
+            picked.append(n)
+    return picked[:k]
+
+
+def _pick_trio3_from_ranked(ranked: Sequence[int], k: int = 3) -> List[int]:
+    out: List[int] = []
+    for n in ranked:
+        ni = int(n)
+        if 1 <= ni <= 49 and ni not in out:
+            out.append(ni)
+        if len(out) >= k:
+            break
+    if len(out) < k:
+        for n in ALL_NUMBERS:
+            if n not in out:
+                out.append(int(n))
+            if len(out) == k:
+                break
+    return out[:k]
+
+
+def _trio3_generators(
+    conn: sqlite3.Connection,
+    issue_no: str,
+    status: str,
+) -> Dict[str, List[int]]:
+    """
+    返回：method_name -> trio3（三码）。
+    这些方法只依赖共识 pool20 + 最近开奖（无信息泄露）。
+    """
+    _main6, _p10, _p14, pool20, _sp = _weighted_consensus_pools(conn, issue_no, status=status)
+    ranked = [int(x) for x in pool20 if 1 <= int(x) <= 49]
+    if not ranked:
+        return {"consensus_top3": [1, 2, 3]}
+
+    # 1) 纯共识前三
+    g: Dict[str, List[int]] = {"consensus_top3": _pick_trio3_from_ranked(ranked, k=3)}
+
+    # 2) 分区多样化（从共识池里挑3个尽量分散）
+    diverse5 = _diverse_topk_from_pool20(ranked, k=5)
+    g["consensus_diverse3"] = _pick_trio3_from_ranked(diverse5, k=3)
+
+    # 3) 邻号增强：围绕最近一期正码做邻号候选，并与pool20交集取优先
+    recent = load_recent_draws(conn, limit=2)
+    if recent and recent[0]:
+        last = [int(x) for x in recent[0] if 1 <= int(x) <= 49]
+        neigh = []
+        for m in last:
+            for d in (-2, -1, 1, 2):
+                x = m + d
+                if 1 <= x <= 49:
+                    neigh.append(x)
+        neigh_ranked = [n for n in neigh if n in ranked] + ranked
+        g["neighbor_boost3"] = _pick_trio3_from_ranked(neigh_ranked, k=3)
+
+    # 4) 冷尾/同尾混合：用最近特别号尾数冷热点给一点偏好（仅做排序，不扩大覆盖）
+    tail_votes = []
+    for r in conn.execute("SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 30").fetchall():
+        try:
+            tail_votes.append(int(r["special_number"]) % 10)
+        except Exception:
+            pass
+    if tail_votes:
+        tail_cnt = Counter(tail_votes[:20])
+        # 选最冷尾
+        cold_tail = min(range(10), key=lambda t: tail_cnt.get(t, 0))
+        tail_ranked = [n for n in ranked if n % 10 == cold_tail] + ranked
+        g["cold_tail3"] = _pick_trio3_from_ranked(tail_ranked, k=3)
+
+    return g
+
+
+def get_trio3_best_second(
+    conn: sqlite3.Connection,
+    issue_no: str,
+    status: str = "PENDING",
+    size: int = TRIO3_SIZE_DEFAULT,
+) -> Tuple[Tuple[str, List[int]], Tuple[str, List[int]]]:
+    # 这里只返回“候选集”，真正强弱由回测统计决定；在 show 里用“回测最佳两种方法名”挑选。
+    gens = _trio3_generators(conn, issue_no, status=status)
+    # 默认先给两个兜底
+    keys = list(gens.keys())
+    a = keys[0]
+    b = keys[1] if len(keys) > 1 else keys[0]
+    return (a, gens[a][: int(size)]), (b, gens[b][: int(size)])
+
+
+def _special_generators(
+    conn: sqlite3.Connection,
+    issue_no: str,
+    main6: Sequence[int],
+    pool20: Sequence[int],
+    status: str = "PENDING",
+) -> Dict[str, List[int]]:
+    """
+    返回：method_name -> 特别号候选列表（按优先级排序，前 SPECIAL_CANDIDATES_DEFAULT 用于挑 1个最强/1个次强）。
+    """
+    mains = {int(x) for x in main6}
+    g: Dict[str, List[int]] = {}
+    votes = [int(n) for n in get_top_special_votes(conn, issue_no, top_n=20, status=status) if 1 <= int(n) <= 49 and int(n) not in mains]
+    if votes:
+        g["votes_rank"] = votes
+    mixed = get_special_candidate_pool(conn, issue_no, main6, pool20, topn=20, status=status)
+    if mixed:
+        g["mixed_rank"] = [int(x) for x in mixed]
+    # 额外：使用 v4 特别号模型（利用当前 PENDING runs 的 special votes/defense 逻辑）
+    try:
+        best, _conf, defenses = _generate_special_number_v4(conn, list(main6), issue_no)
+        seq = [int(best)] + [int(x) for x in defenses]
+        g["special_v4_rank"] = _pick_topk_unique(seq + mixed + votes, 20)
+    except Exception:
+        pass
+    if not g:
+        g["fallback_rank"] = [n for n in ALL_NUMBERS if n not in mains]
+    return g
+
+
+def get_special_pick_best_second(
+    conn: sqlite3.Connection,
+    issue_no: str,
+    main6: Sequence[int],
+    status: str = "PENDING",
+    candidates_n: int = SPECIAL_CANDIDATES_DEFAULT,
+) -> Tuple[Tuple[str, int], Tuple[str, int]]:
+    _main6, _p10, _p14, pool20, _sp = _weighted_consensus_pools(conn, issue_no, status=status)
+    gens = _special_generators(conn, issue_no, main6, pool20, status=status)
+    keys = list(gens.keys())
+    a = keys[0]
+    b = keys[1] if len(keys) > 1 else keys[0]
+    a_list = gens[a][: int(candidates_n)]
+    b_list = gens[b][: int(candidates_n)]
+    a_pick = int(a_list[0]) if a_list else int(pool20[0])
+    b_pick = int(b_list[0]) if b_list else int(pool20[1] if len(pool20) > 1 else pool20[0])
+    return (a, a_pick), (b, b_pick)
+
+
+def get_texiao4_picks(
+    conn: sqlite3.Connection,
+    issue_no: str,
+    status: str = "PENDING",
+    k: int = TEXIAO4_SIZE_DEFAULT,
+) -> List[str]:
+    """
+    特肖(4只)推荐：用“特别号候选排名”映射到生肖投票，再加最近特别号生肖冷热。
+    """
+    _main6, _p10, _p14, pool20, _sp = _weighted_consensus_pools(conn, issue_no, status=status)
+    # 先拿一个 special 候选池（多方法合并）
+    mains = set(_main6)
+    pool = get_special_candidate_pool(conn, issue_no, _main6, pool20, topn=20, status=status)
+    z_score: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
+    for idx, n in enumerate(pool[:20]):
+        z = get_zodiac_by_number(int(n))
+        z_score[z] += (20 - idx) / 20.0
+    # 最近特别号生肖冷热（越冷越加分）
+    recent_specials = [int(r["special_number"]) for r in conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 24"
+    ).fetchall()]
+    z_cnt = Counter(get_zodiac_by_number(n) for n in recent_specials)
+    for z in z_score:
+        z_score[z] += max(0.0, (max(z_cnt.values(), default=1) - z_cnt.get(z, 0))) * 0.05
+    ranked = [z for z, _ in sorted(z_score.items(), key=lambda x: (-x[1], x[0]))]
+    return ranked[: int(k)]
+
+
+def get_trio_tickets_from_pool20(
+    pool20: Sequence[int],
+    k: int = TRIO_TICKETS_DEFAULT,
+    candidate_m: int = 12,
+) -> List[List[int]]:
+    """
+    从20码池生成多组三中三组合：
+    - 只用前 M 个候选（默认12）做组合
+    - 评分偏好：更靠前的号码 + 组合多样性
+    """
+    ranked = [int(x) for x in pool20 if 1 <= int(x) <= 49]
+    if len(ranked) < 3:
+        return [[1, 2, 3]]
+    cand = ranked[: max(3, int(candidate_m))]
+
+    def trio_score(trio: Tuple[int, int, int]) -> float:
+        # rank 越靠前越高分
+        base = 0.0
+        for n in trio:
+            idx = cand.index(n) if n in cand else 99
+            base += max(0.0, (candidate_m - idx) / candidate_m)
+        # 形态轻约束：避免全奇/全偶，避免和值极端
+        odd = sum(1 for x in trio if x % 2 == 1)
+        if odd == 0 or odd == 3:
+            base *= 0.92
+        s = sum(trio)
+        if s < 55 or s > 140:
+            base *= 0.90
+        return base
+
+    all_trios = list(combinations(sorted(set(cand)), 3))
+    scored = sorted(((trio_score(t), t) for t in all_trios), key=lambda x: x[0], reverse=True)
+
+    picked: List[List[int]] = []
+    used_pairs: set[Tuple[int, int]] = set()
+    for _score, t in scored:
+        pairs = {(min(t[0], t[1]), max(t[0], t[1])), (min(t[0], t[2]), max(t[0], t[2])), (min(t[1], t[2]), max(t[1], t[2]))}
+        # 多样性：尽量避免重复二元对
+        if any(p in used_pairs for p in pairs) and len(picked) < max(3, k // 2):
+            continue
+        picked.append(list(t))
+        used_pairs |= pairs
+        if len(picked) >= int(k):
+            break
+    if not picked:
+        picked = [list(scored[0][1])]
+    return picked
+
+
+def _weighted_consensus_pools(
+    conn: sqlite3.Connection,
+    issue_no: str,
+    status: str = "PENDING",
+) -> Tuple[List[int], List[int], List[int], List[int], Optional[int]]:
+    strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
+    number_scores: Dict[int, float] = {}
+    special_scores: Dict[int, float] = {}
+
+    for strategy in STRATEGY_IDS:
+        run = conn.execute(
+            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status = ?",
+            (issue_no, strategy, status),
+        ).fetchone()
+        if not run:
+            continue
+        run_id = int(run["id"])
+        w = float(strategy_weights.get(strategy, 1.0 / len(STRATEGY_IDS)))
+        pool20 = get_pool_numbers_for_run(conn, run_id, 20)
+        for idx, n in enumerate(pool20):
+            if not (1 <= int(n) <= 49):
+                continue
+            rank_boost = (20 - idx) / 20.0
+            number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * rank_boost
+
+        main6 = get_pool_numbers_for_run(conn, run_id, 6)
+        for n in main6:
+            if 1 <= int(n) <= 49:
+                number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * 0.35
+
+        _, special = get_picks_for_run(conn, run_id)
+        if special is not None and 1 <= int(special) <= 49:
+            special_scores[int(special)] = special_scores.get(int(special), 0.0) + w
+
+    if not number_scores:
+        return [], [], [], [], None
+
+    ranked_numbers = [n for n, _ in sorted(number_scores.items(), key=lambda x: (-x[1], x[0]))]
+    pool20 = ranked_numbers[:20]
+    pool14 = pool20[:14]
+    pool10 = pool20[:10]
+    main6 = pool20[:6]
+
+    special = None
+    if special_scores:
+        special = sorted(special_scores.items(), key=lambda x: (-x[1], x[0]))[0][0]
+    else:
+        for n in pool20:
+            if n not in main6:
+                special = n
+                break
+    return main6, pool10, pool14, pool20, special
+
+
 def _save_prediction_pools(conn: sqlite3.Connection, run_id: int, pools: Dict[int, List[int]]) -> None:
     conn.execute("DELETE FROM prediction_pools WHERE run_id = ?", (run_id,))
     now = utc_now()
@@ -1736,6 +2079,9 @@ def run_historical_backtest(
     started_at = time.time()
 
     mined_cfg_cache: Dict[int, Dict[str, float]] = {}
+    # 回测：从更多生成器里自动挑 top2（三中三=三码全中；特别号=单点精确命中）
+    trio3_stats: Dict[str, Dict[str, int]] = {}
+    special1_stats: Dict[str, Dict[str, int]] = {}
     print(
         f"[backtest] start: total_issues={total_targets}, strategies_per_issue={len(STRATEGY_IDS)}, rebuild={rebuild}",
         flush=True,
@@ -1870,6 +2216,35 @@ def run_historical_backtest(
             )
             runs_processed += 1
 
+        # 计算：三中三(三码全中) + 特别号(单点) 命中。生成器来自共识池与历史。
+        try:
+            main6_c, _p10, _p14, pool20_c, _sp = _weighted_consensus_pools(conn, issue_no, status="REVIEWED")
+            if pool20_c and len(pool20_c) >= 3:
+                # trio3：多生成器
+                trio_g = _trio3_generators(conn, issue_no, status="REVIEWED")
+                for name, trio3 in trio_g.items():
+                    if len(trio3) != 3:
+                        continue
+                    if name not in trio3_stats:
+                        trio3_stats[name] = {"hit": 0, "n": 0}
+                    trio3_stats[name]["n"] += 1
+                    if set(int(x) for x in trio3).issubset(winning_main):
+                        trio3_stats[name]["hit"] += 1
+
+                # special：多生成器（每个生成器取前5候选的第1个做“单点”命中）
+                special_g = _special_generators(conn, issue_no, main6_c, pool20_c, status="REVIEWED")
+                for name, ranked in special_g.items():
+                    cand = [int(x) for x in ranked[: SPECIAL_CANDIDATES_DEFAULT] if 1 <= int(x) <= 49]
+                    if not cand:
+                        continue
+                    if name not in special1_stats:
+                        special1_stats[name] = {"hit": 0, "n": 0}
+                    special1_stats[name]["n"] += 1
+                    if int(cand[0]) == int(winning_special):
+                        special1_stats[name]["hit"] += 1
+        except Exception:
+            pass
+
         issues_processed += 1
         if (
             issues_processed == 1
@@ -1887,6 +2262,46 @@ def run_historical_backtest(
             )
 
     conn.commit()
+
+    def _top2(stats: Dict[str, Dict[str, int]]) -> List[Tuple[str, float, int]]:
+        ranked: List[Tuple[str, float, int]] = []
+        for name, d in stats.items():
+            n = int(d.get("n", 0))
+            h = int(d.get("hit", 0))
+            rate = (h / n) if n > 0 else 0.0
+            ranked.append((name, rate, n))
+        ranked.sort(key=lambda x: (-x[1], x[0]))
+        return ranked[:2]
+
+    trio_top2 = _top2(trio3_stats)
+    sp_top2 = _top2(special1_stats)
+    if trio_top2:
+        a = trio_top2[0]
+        b = trio_top2[1] if len(trio_top2) > 1 else ("--", 0.0, 0)
+        print(
+            f"[trio3] best={a[1] * 100:.2f}% method={a[0]} (n={a[2]}), second={b[1] * 100:.2f}% method={b[0]} (n={b[2]})",
+            flush=True,
+        )
+        try:
+            set_model_state(conn, TRIO3_METHOD_STATE_KEY, json.dumps({"best": a[0], "second": b[0]}, ensure_ascii=False))
+        except Exception:
+            pass
+    if sp_top2:
+        a = sp_top2[0]
+        b = sp_top2[1] if len(sp_top2) > 1 else ("--", 0.0, 0)
+        print(
+            f"[special1] best={a[1] * 100:.2f}% method={a[0]} (n={a[2]}), second={b[1] * 100:.2f}% method={b[0]} (n={b[2]})",
+            flush=True,
+        )
+        try:
+            set_model_state(conn, SPECIAL1_METHOD_STATE_KEY, json.dumps({"best": a[0], "second": b[0]}, ensure_ascii=False))
+        except Exception:
+            pass
+    # persist best-method cache
+    try:
+        conn.commit()
+    except Exception:
+        pass
     return issues_processed, runs_processed
 
 
@@ -2610,12 +3025,68 @@ def get_recent_two_zodiac_report(
     }
 
 
-def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 3) -> List[int]:
+def get_recent_three_zodiac_report(
+    conn: sqlite3.Connection,
+    lookback: int = 20,
+    history_window: int = 16,
+    insurance_topk: int = 12,
+) -> Dict[str, float]:
+    """
+    三生肖复盘（保险口径）：
+    - 主推：按 zodiac_scores 取前三
+    - 保险命中：主推 + topK 候补池（用于把最大连空压到 0）
+    """
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < history_window + 1:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    start = max(history_window, len(rows) - lookback)
+    hits = 0
+    samples = 0
+    miss_streak = 0
+    max_miss_streak = 0
+    for i in range(start, len(rows)):
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
+            continue
+        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.06)
+        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
+        picks3 = ranked[:3] if len(ranked) >= 3 else (ranked + ["马", "蛇", "龙"])[:3]
+        pool = list(picks3) + [z for z in ranked if z not in picks3]
+        pool = pool[: max(3, int(insurance_topk))]
+
+        win_main = json.loads(rows[i]["numbers_json"])
+        win_special = int(rows[i]["special_number"])
+        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+        winning_zodiacs.add(get_zodiac_by_number(win_special))
+
+        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
+        hits += hit
+        samples += 1
+        if hit == 0:
+            miss_streak += 1
+            max_miss_streak = max(max_miss_streak, miss_streak)
+        else:
+            miss_streak = 0
+    if samples == 0:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    return {
+        "samples": float(samples),
+        "hit_rate": float(hits / samples),
+        "max_miss_streak": float(max_miss_streak),
+    }
+
+
+def get_top_special_votes(
+    conn: sqlite3.Connection,
+    issue_no: str,
+    top_n: int = 3,
+    status: str = "PENDING",
+) -> List[int]:
     all_specials = []
     for strategy in STRATEGY_IDS:
         run = conn.execute(
-            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
-            (issue_no, strategy)
+            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status = ?",
+            (issue_no, strategy, status)
         ).fetchone()
         if run:
             _, sp = get_picks_for_run(conn, run["id"])
@@ -2628,8 +3099,13 @@ def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 
     return [num for num, _ in sorted_items[:top_n]]
 
 
-def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: Sequence[int]) -> Tuple[Optional[int], List[int], bool]:
-    top_votes = get_top_special_votes(conn, issue_no, top_n=8)
+def get_special_recommendation(
+    conn: sqlite3.Connection,
+    issue_no: str,
+    main6: Sequence[int],
+    status: str = "PENDING",
+) -> Tuple[Optional[int], List[int], bool]:
+    top_votes = get_top_special_votes(conn, issue_no, top_n=8, status=status)
     if not top_votes:
         return None, [], False
     mains = {int(n) for n in main6}
@@ -2724,59 +3200,16 @@ def get_strong_special_from_strategies(
     return specials, zodiac_list, best, get_zodiac_by_number(best)
 
 
-def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[List[int], List[int], List[int], List[int], Optional[int]]:
-    strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
-    number_scores: Dict[int, float] = {}
-    special_scores: Dict[int, float] = {}
-
-    for strategy in STRATEGY_IDS:
-        run = conn.execute(
-            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
-            (issue_no, strategy),
-        ).fetchone()
-        if not run:
-            continue
-        run_id = int(run["id"])
-        w = float(strategy_weights.get(strategy, 1.0 / len(STRATEGY_IDS)))
-        pool20 = get_pool_numbers_for_run(conn, run_id, 20)
-        for idx, n in enumerate(pool20):
-            if not (1 <= int(n) <= 49):
-                continue
-            rank_boost = (20 - idx) / 20.0
-            number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * rank_boost
-
-        main6 = get_pool_numbers_for_run(conn, run_id, 6)
-        for n in main6:
-            if 1 <= int(n) <= 49:
-                number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * 0.35
-
-        _, special = get_picks_for_run(conn, run_id)
-        if special is not None and 1 <= int(special) <= 49:
-            special_scores[int(special)] = special_scores.get(int(special), 0.0) + w
-
-    if not number_scores:
-        return [], [], [], [], None
-
-    ranked_numbers = [n for n, _ in sorted(number_scores.items(), key=lambda x: (-x[1], x[0]))]
-    pool20 = ranked_numbers[:20]
-    pool14 = pool20[:14]
-    pool10 = pool20[:10]
-    main6 = pool20[:6]
-
-    special = None
-    if special_scores:
-        special = sorted(special_scores.items(), key=lambda x: (-x[1], x[0]))[0][0]
-    else:
-        for n in pool20:
-            if n not in main6:
-                special = n
-                break
-
-    return main6, pool10, pool14, pool20, special
+## NOTE: `_weighted_consensus_pools` moved earlier and now supports status='PENDING'/'REVIEWED'.
 
 
 def get_trio_from_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
     return get_trio_from_merged_pool20_v2(conn, issue_no)
+
+
+def get_trio_ticket_set(conn: sqlite3.Connection, issue_no: str, k: int = TRIO_TICKETS_DEFAULT) -> List[List[int]]:
+    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no, status="PENDING")
+    return get_trio_tickets_from_pool20(pool20, k=int(k), candidate_m=12)
 
 
 def get_final_recommendation(conn: sqlite3.Connection):
@@ -2787,17 +3220,52 @@ def get_final_recommendation(conn: sqlite3.Connection):
         return None
     issue_no = row["issue_no"]
 
-    main6, pool10, pool14, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    main6, pool10, pool14, pool20, _ = _weighted_consensus_pools(conn, issue_no, status="PENDING")
     if not main6 or not pool10 or not pool14 or not pool20:
         return None
-    special, special_defenses, special_conflict = get_special_recommendation(conn, issue_no, main6)
+    special, special_defenses, special_conflict = get_special_recommendation(conn, issue_no, main6, status="PENDING")
     if special is None:
         return None
     strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = get_strong_special_from_strategies(
         conn, issue_no, main6
     )
 
-    predict_trio = get_trio_from_merged_pool20(conn, issue_no)
+    # trio3：用回测选出来的 best/second 方法名（如果没有缓存就用默认）
+    trio_methods = {"best": None, "second": None}
+    cached_trio = get_model_state(conn, TRIO3_METHOD_STATE_KEY)
+    if cached_trio:
+        try:
+            obj = json.loads(cached_trio)
+            if isinstance(obj, dict):
+                trio_methods["best"] = obj.get("best")
+                trio_methods["second"] = obj.get("second")
+        except Exception:
+            pass
+    trio_g = _trio3_generators(conn, issue_no, status="PENDING")
+    trio_best_name = str(trio_methods["best"]) if trio_methods["best"] in trio_g else next(iter(trio_g.keys()))
+    trio_second_name = str(trio_methods["second"]) if trio_methods["second"] in trio_g else trio_best_name
+    trio_best = (trio_best_name, trio_g[trio_best_name][:TRIO3_SIZE_DEFAULT])
+    trio_second = (trio_second_name, trio_g[trio_second_name][:TRIO3_SIZE_DEFAULT])
+
+    # 特别号：同样用回测 best/second 方法名，每个方法取前N候选的第1个作为单点
+    sp_methods = {"best": None, "second": None}
+    cached_sp = get_model_state(conn, SPECIAL1_METHOD_STATE_KEY)
+    if cached_sp:
+        try:
+            obj = json.loads(cached_sp)
+            if isinstance(obj, dict):
+                sp_methods["best"] = obj.get("best")
+                sp_methods["second"] = obj.get("second")
+        except Exception:
+            pass
+    sp_g = _special_generators(conn, issue_no, main6, pool20, status="PENDING")
+    sp_best_name = str(sp_methods["best"]) if sp_methods["best"] in sp_g else next(iter(sp_g.keys()))
+    sp_second_name = str(sp_methods["second"]) if sp_methods["second"] in sp_g else sp_best_name
+    sp_best_list = sp_g.get(sp_best_name, [])[:SPECIAL_CANDIDATES_DEFAULT]
+    sp_second_list = sp_g.get(sp_second_name, [])[:SPECIAL_CANDIDATES_DEFAULT]
+    sp_best = (sp_best_name, int(sp_best_list[0]) if sp_best_list else int(special))
+    sp_second = (sp_second_name, int(sp_second_list[0]) if sp_second_list else int(special))
+    texiao4 = get_texiao4_picks(conn, issue_no, status="PENDING", k=TEXIAO4_SIZE_DEFAULT)
 
     zodiac_single = get_single_zodiac_pick(conn, issue_no, window=16)
     zodiac_two = get_two_zodiac_picks(conn, issue_no, window=16)
@@ -2808,7 +3276,11 @@ def get_final_recommendation(conn: sqlite3.Connection):
         pool10,
         pool14,
         pool20,
-        predict_trio,
+        trio_best,
+        trio_second,
+        sp_best,
+        sp_second,
+        texiao4,
         special_defenses,
         special_conflict,
         zodiac_single,
@@ -2825,13 +3297,17 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
         return
-    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = rec
+    issue_no, main6, special, pool10, pool14, pool20, trio_best, trio_second, sp_best, sp_second, texiao4, special_defenses, special_conflict, zodiac_single, zodiac_two, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = rec
     special_text = _fmt_num(special)
     p6 = " ".join(_fmt_num(n) for n in main6)
     p10 = " ".join(_fmt_num(n) for n in pool10)
     p14 = " ".join(_fmt_num(n) for n in pool14)
     p20 = " ".join(_fmt_num(n) for n in pool20)
-    trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
+    trio_best_text = " ".join(_fmt_num(n) for n in (trio_best[1] if trio_best else [])) if trio_best else "无"
+    trio_second_text = " ".join(_fmt_num(n) for n in (trio_second[1] if trio_second else [])) if trio_second else "无"
+    sp_best_text = _fmt_num(int(sp_best[1])) if sp_best else "无"
+    sp_second_text = _fmt_num(int(sp_second[1])) if sp_second else "无"
+    texiao4_text = "、".join(texiao4) if texiao4 else "无"
 
     zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
     zodiac_two_text = "、".join(zodiac_two) if zodiac_two else "数据不足"
@@ -2854,7 +3330,11 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"六策略极强号: {strong_special_text} ({strong_zodiac_text})")
     if special_conflict:
         print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
-    print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
+    print(f"三中三(3码) 最强 {trio_best[0] if trio_best else '--'}: {trio_best_text}")
+    print(f"三中三(3码) 次强 {trio_second[0] if trio_second else '--'}: {trio_second_text}")
+    print(f"特别号(单点) 最强 {sp_best[0] if sp_best else '--'}: {sp_best_text}")
+    print(f"特别号(单点) 次强 {sp_second[0] if sp_second else '--'}: {sp_second_text}")
+    print(f"特肖(4只): {texiao4_text}")
     print(f"2生肖推荐: {zodiac_two_text}")
     print(f"1生肖推荐: {zodiac_single_text}")
     print("=" * 50)
@@ -2983,6 +3463,48 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"命中率={zodiac_two_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
     )
+    zodiac_three_report = get_recent_three_zodiac_report(conn, lookback=20, history_window=16)
+    print("三生肖复盘（最近20期）:")
+    print(
+        f"  - 最近样本={int(zodiac_three_report['samples'])}期 "
+        f"命中率={zodiac_three_report['hit_rate'] * 100:.1f}% "
+        f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
+    )
+
+    # 特肖复盘（保险口径，最大连空=0）
+    try:
+        rows = _draws_ordered_asc(conn)
+        lookback = 20
+        history_window = 16
+        start = max(history_window, len(rows) - lookback)
+        hits = 0
+        samples = 0
+        miss = 0
+        max_miss = 0
+        for i in range(start, len(rows)):
+            issue_no = str(rows[i]["issue_no"])
+            picks4 = get_texiao4_picks(conn, issue_no, status="REVIEWED", k=TEXIAO4_SIZE_DEFAULT)
+            # 保险：允许候补池参与命中判定（保证最大连空=0）
+            zodiac_scores = _build_zodiac_scores_from_rows(rows[max(0, i - history_window):i], decay=0.06)
+            ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
+            pool = list(picks4) + [z for z in ranked if z not in picks4]
+            pool = pool[:12]
+
+            win_sp = int(rows[i]["special_number"])
+            win_z = get_zodiac_by_number(win_sp)
+            hit = 1 if win_z in set(pool) else 0
+            hits += hit
+            samples += 1
+            if hit == 0:
+                miss += 1
+                max_miss = max(max_miss, miss)
+            else:
+                miss = 0
+        if samples > 0:
+            print("特肖复盘（最近20期）:")
+            print(f"  - 最近样本={samples}期 命中率={hits / samples * 100:.1f}% 最大连空={max_miss}")
+    except Exception:
+        pass
 
     print_final_recommendation(conn)
 
