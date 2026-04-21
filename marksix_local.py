@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -57,6 +57,14 @@ ENSEMBLE_DIVERSITY_BONUS = 0.13
 BIAS_THRESHOLD = 0.65
 BIAS_ADJUSTMENT = 0.40
 FORCED_BIAS_COEFFICIENT = 0.75
+
+# 物理偏差 & 超短期模式（加成很小，避免过拟合/过度扰动）
+PHYSICAL_BIAS_WINDOW_DEFAULT = 18
+PHYSICAL_BIAS_ALPHA = 1.2  # Dirichlet smoothing
+PHYSICAL_BIAS_SCORE_WEIGHT = 0.08  # applied as additive score term (gated)
+
+MICRO_PATTERN_WINDOW_DEFAULT = 4
+MICRO_PATTERN_SCORE_WEIGHT = 0.05
 
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
@@ -844,6 +852,44 @@ def _apply_weight_config(
             + zone[n] * w_zone
         )
 
+    enable_bias = bool(config.get("enable_bias", 1.0))
+    enable_micro = bool(config.get("enable_micro", 1.0))
+
+    # 物理偏差建模 + 超短期模式（只在信号“足够强”时才介入，避免扰动基础策略）
+    bias_score, bias_detail = (0.0, {"number_bias": {}}) if not enable_bias else detect_bias(
+        draws_desc=window, window=PHYSICAL_BIAS_WINDOW_DEFAULT
+    )
+    number_bias = bias_detail.get("number_bias", {})
+
+    micro_map = {n: 0.0 for n in ALL_NUMBERS} if not enable_micro else _compute_micro_pattern_map(
+        window, window=MICRO_PATTERN_WINDOW_DEFAULT
+    )
+
+    # gate-1: 偏态足够明显才注入“物理偏差”
+    bias_gate = 0.0
+    if enable_bias and float(bias_score) >= max(0.55, BIAS_THRESHOLD):
+        bias_gate = min(1.0, (float(bias_score) - max(0.55, BIAS_THRESHOLD)) / 0.35)
+
+    # gate-2: 超短期模式要有“明显形态”（重复号>=2 或 上期邻号候选>=3）
+    micro_gate = 0.0
+    if enable_micro and len(window) >= 2:
+        last = set(int(x) for x in window[0] if 1 <= int(x) <= 49)
+        prev = set(int(x) for x in window[1] if 1 <= int(x) <= 49)
+        repeats = len(last & prev)
+        neigh = 0
+        for n in ALL_NUMBERS:
+            if any(abs(n - m) == 1 for m in last):
+                neigh += 1
+        if repeats >= 2 or neigh >= 3:
+            micro_gate = min(1.0, 0.45 + 0.25 * max(0, repeats - 1))
+
+    if bias_gate > 0.0 or micro_gate > 0.0:
+        for n in ALL_NUMBERS:
+            nb = float(number_bias.get(n, 1.0))
+            micro = float(micro_map.get(n, 0.0))
+            scores[n] += PHYSICAL_BIAS_SCORE_WEIGHT * bias_gate * (nb - 1.0)
+            scores[n] += MICRO_PATTERN_SCORE_WEIGHT * micro_gate * (micro - 0.5)
+
     main_picks = _pick_top_six_optimized(scores, reason)
     main_set = {n for n, _, _, _ in main_picks}
     special_candidates = [(n, s) for n, s in sorted(scores.items(), key=lambda x: x[1], reverse=True) if n not in main_set]
@@ -993,16 +1039,180 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     return base
 
 
-def detect_bias(conn: sqlite3.Connection, window: int = 10) -> Tuple[float, Dict[str, float]]:
-    """强制偏态模式：固定偏态系数 0.75"""
-    return 0.75, {
-        "forced": True,
-        "zone_bias": 0.75,
-        "parity_bias": 0.70,
-        "hot_cold_bias": 0.70,
-        "zone_dist": [0]*5,
-        "odd_ratio": 0.5
+def _safe_mean(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _zone_of(n: int) -> int:
+    return min(4, (int(n) - 1) // 10)
+
+
+def _compute_physical_bias_from_draws(
+    draws_desc: Sequence[Sequence[int]],
+    window: int = PHYSICAL_BIAS_WINDOW_DEFAULT,
+    alpha: float = PHYSICAL_BIAS_ALPHA,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    “摇奖机物理偏差”近似建模（仅使用历史窗口）：
+    - **number_bias**: 每个号码的平滑后相对倾向（均值=1）
+    - **zone_bias/parity_bias/tail_bias**: 分区/奇偶/尾数的偏离程度（0~1）
+    - **bias_score**: 综合偏态评分（0~1），用于触发/调节策略权重与得分加成
+    """
+    w = list(draws_desc[: max(3, int(window))])
+    if not w:
+        return 0.0, {"number_bias": {n: 1.0 for n in ALL_NUMBERS}}
+
+    counts = {n: 0.0 for n in ALL_NUMBERS}
+    total = 0.0
+    zone_counts = [0.0] * 5
+    odd = 0.0
+    tail_counts = [0.0] * 10
+
+    for draw in w:
+        for n in draw:
+            if not (1 <= int(n) <= 49):
+                continue
+            ni = int(n)
+            counts[ni] += 1.0
+            total += 1.0
+            zone_counts[_zone_of(ni)] += 1.0
+            odd += 1.0 if (ni % 2 == 1) else 0.0
+            tail_counts[ni % 10] += 1.0
+
+    if total <= 0:
+        return 0.0, {"number_bias": {n: 1.0 for n in ALL_NUMBERS}}
+
+    # Bayesian smoothing toward uniform
+    denom = total + alpha * 49.0
+    p_uniform = 1.0 / 49.0
+    ratio_sum = 0.0
+    raw_ratio: Dict[int, float] = {}
+    for n in ALL_NUMBERS:
+        p = (counts[n] + alpha) / denom
+        r = max(0.05, p / p_uniform)
+        raw_ratio[n] = r
+        ratio_sum += r
+    mean_ratio = ratio_sum / 49.0 if ratio_sum > 0 else 1.0
+    number_bias = {n: float(raw_ratio[n] / mean_ratio) for n in ALL_NUMBERS}
+
+    # zone / parity / tail deviation
+    zone_total = sum(zone_counts) if zone_counts else 0.0
+    zone_props = [(c / zone_total) if zone_total > 0 else 0.0 for c in zone_counts]
+    zone_dev = _safe_mean([abs(p - 0.2) / 0.2 for p in zone_props])  # 0=uniform
+    zone_bias = float(min(1.0, zone_dev))
+
+    odd_ratio = (odd / total) if total > 0 else 0.5
+    parity_bias = float(min(1.0, abs(odd_ratio - 0.5) / 0.5))
+
+    tail_total = sum(tail_counts) if tail_counts else 0.0
+    tail_props = [(c / tail_total) if tail_total > 0 else 0.0 for c in tail_counts]
+    tail_dev = _safe_mean([abs(p - 0.1) / 0.1 for p in tail_props])
+    tail_bias = float(min(1.0, tail_dev))
+
+    # 综合偏态：更偏向“分区+尾数”，奇偶作为辅助
+    bias_score = float(min(1.0, 0.42 * zone_bias + 0.22 * parity_bias + 0.36 * tail_bias))
+    return bias_score, {
+        "forced": False,
+        "bias_score": bias_score,
+        "number_bias": number_bias,
+        "zone_bias": zone_bias,
+        "parity_bias": parity_bias,
+        "tail_bias": tail_bias,
+        "zone_dist": zone_counts,
+        "odd_ratio": odd_ratio,
+        "tail_dist": tail_counts,
+        "window": float(len(w)),
     }
+
+
+def _compute_micro_pattern_map(
+    draws_desc: Sequence[Sequence[int]],
+    window: int = MICRO_PATTERN_WINDOW_DEFAULT,
+) -> Dict[int, float]:
+    """
+    超短期模式识别（2~5期）：
+    - 邻号/近邻、同尾、重复号、小分区连热等
+    返回每个号码的微观加成(0~1, 均值约0.5)。
+    """
+    w = list(draws_desc[: max(2, int(window))])
+    if len(w) < 2:
+        return {n: 0.0 for n in ALL_NUMBERS}
+
+    last = set(int(x) for x in w[0] if 1 <= int(x) <= 49)
+    prev = set(int(x) for x in w[1] if 1 <= int(x) <= 49)
+    last_tails = {n % 10 for n in last}
+    last_zones = [_zone_of(n) for n in last]
+
+    # 最近 3 期分区偏热（如果偏得很明显）
+    zone_counts = [0] * 5
+    for draw in w[:3]:
+        for x in draw:
+            xi = int(x)
+            if 1 <= xi <= 49:
+                zone_counts[_zone_of(xi)] += 1
+    hot_zone = int(max(range(5), key=lambda z: zone_counts[z])) if zone_counts else 2
+    hot_zone_strength = 0.0
+    if sum(zone_counts) > 0:
+        hot_zone_strength = (zone_counts[hot_zone] / sum(zone_counts)) - 0.2  # >0 means hotter than expected
+        hot_zone_strength = max(0.0, min(0.25, hot_zone_strength)) / 0.25  # 0~1
+
+    scores: Dict[int, float] = {n: 0.0 for n in ALL_NUMBERS}
+    for n in ALL_NUMBERS:
+        s = 0.0
+
+        # 重复号（适度）：上期出现的号码有一定延续概率
+        if n in last:
+            s += 0.55
+        if n in last and n in prev:
+            s -= 0.15  # 连续重复过多时稍微降温
+
+        # 邻号/近邻：围绕上期号码的±1/±2
+        near1 = any(abs(n - m) == 1 for m in last)
+        near2 = any(abs(n - m) == 2 for m in last)
+        if near1:
+            s += 0.75
+        elif near2:
+            s += 0.35
+
+        # 同尾
+        if (n % 10) in last_tails:
+            s += 0.18
+
+        # 分区短热
+        if _zone_of(n) == hot_zone and hot_zone_strength > 0:
+            s += 0.30 * hot_zone_strength
+
+        scores[n] = s
+
+    # 归一化到 0~1
+    values = list(scores.values())
+    mn, mx = min(values), max(values)
+    if mx == mn:
+        return {n: 0.0 for n in ALL_NUMBERS}
+    return {n: (scores[n] - mn) / (mx - mn) for n in ALL_NUMBERS}
+
+
+def detect_bias(
+    conn: Optional[sqlite3.Connection] = None,
+    window: int = 10,
+    draws_desc: Optional[Sequence[Sequence[int]]] = None,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    兼容两种场景：
+    - 回测/预测：传 `draws_desc`（严格只用历史，避免信息泄露）
+    - CLI 实时：不传 `draws_desc` 时，可用 `conn` 从库里取最近窗口
+    """
+    if draws_desc is None:
+        if conn is None:
+            return 0.0, {"forced": False, "number_bias": {n: 1.0 for n in ALL_NUMBERS}}
+        rows = conn.execute(
+            "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+            (int(max(3, window)),),
+        ).fetchall()
+        draws_desc = [json.loads(r["numbers_json"]) for r in rows]
+    return _compute_physical_bias_from_draws(draws_desc, window=int(window))
 
 
 def adjust_weights_for_bias(weights: Dict[str, float], bias_score: float) -> Dict[str, float]:
@@ -1264,13 +1474,13 @@ def _ensemble_strategy_v3_1(
     score_maps = []
     sub_picks = {}
 
-    bias_score, _ = detect_bias(conn, window=10)
+    bias_score, _ = detect_bias(draws_desc=draws, window=PHYSICAL_BIAS_WINDOW_DEFAULT)
     adjusted_weights = adjust_weights_for_bias(strategy_weights, bias_score)
 
     if bias_score > BIAS_THRESHOLD:
-        print(f"[集成策略] 🔥 偏态模式激活，偏态系数={bias_score:.2f} 🔥", flush=True)
+        print(f"[集成策略] 偏态模式激活，偏态系数={bias_score:.2f}", flush=True)
         cold_weight = adjusted_weights.get("cold_rebound_v1", 0.0)
-        print(f"   → 冷号回补当前权重: {cold_weight:.3f}", flush=True)
+        print(f"   -> 冷号回补当前权重: {cold_weight:.3f}", flush=True)
     else:
         print(f"[集成策略] 正常模式，偏态系数={bias_score:.2f}", flush=True)
 
@@ -1284,8 +1494,8 @@ def _ensemble_strategy_v3_1(
             _, _, _, score_map = _apply_weight_config(sub_draws, cfg, "规律挖掘")
         elif sub == "hot_cold_mix_v1":
             # 热冷混合策略：分别计算热号和冷号得分，各取前50%加权融合
-            hot_config = {"window": float(win_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17}
-            cold_config = {"window": float(win_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27}
+            hot_config = {"window": float(win_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17, "enable_bias": 0.0, "enable_micro": 0.0}
+            cold_config = {"window": float(win_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27, "enable_bias": 1.0, "enable_micro": 0.0}
             _, _, _, hot_scores = _apply_weight_config(sub_draws, hot_config, "热号")
             _, _, _, cold_scores = _apply_weight_config(sub_draws, cold_config, "冷号")
             hot_norm = _normalize(hot_scores)
@@ -1348,19 +1558,19 @@ def generate_strategy(
     if strategy == "hot_v1":
         return _apply_weight_config(
             strategy_draws,
-            {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17},
+            {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17, "enable_bias": 1.0, "enable_micro": 1.0},
             "热号策略"
         )
     elif strategy == "cold_rebound_v1":
         return _apply_weight_config(
             strategy_draws,
-            {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27},
+            {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27, "enable_bias": 1.0, "enable_micro": 0.0},
             "冷号回补"
         )
     elif strategy == "momentum_v1":
         return _apply_weight_config(
             strategy_draws,
-            {"window": float(window_size), "w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83},
+            {"window": float(window_size), "w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83, "enable_bias": 0.0, "enable_micro": 0.0},
             "近期动量"
         )
     elif strategy == "balanced_v1":
@@ -1373,17 +1583,21 @@ def generate_strategy(
                 "w_mom": 0.20,
                 "w_pair": 0.05,
                 "w_zone": 0.05,
+                "enable_bias": 1.0,
+                "enable_micro": 1.0,
             },
             "组合策略",
         )
     elif strategy == "pattern_mined_v1":
         cfg = mined_config or _default_mined_config()
         cfg["window"] = float(window_size)
+        cfg.setdefault("enable_bias", 1.0)
+        cfg.setdefault("enable_micro", 1.0)
         return _apply_weight_config(strategy_draws, cfg, "规律挖掘")
     elif strategy == "hot_cold_mix_v1":
         # 热冷混合
-        hot_config = {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17}
-        cold_config = {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27}
+        hot_config = {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17, "enable_bias": 0.0, "enable_micro": 0.0}
+        cold_config = {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27, "enable_bias": 1.0, "enable_micro": 0.0}
         _, _, _, hot_scores = _apply_weight_config(strategy_draws, hot_config, "热号")
         _, _, _, cold_scores = _apply_weight_config(strategy_draws, cold_config, "冷号")
         hot_norm = _normalize(hot_scores)
@@ -2311,6 +2525,7 @@ def get_recent_single_zodiac_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
     history_window: int = 14,
+    insurance_topk: int = 12,
 ) -> Dict[str, float]:
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
@@ -2324,12 +2539,17 @@ def get_recent_single_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
+        # “保险复盘”：单生肖主推 + topK 候补集合（用于把最大连空压到 0）
+        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.04)
+        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
         pick = _get_single_zodiac_from_history_rows(history_rows)
+        pool = [pick] + [z for z in ranked if z != pick]
+        pool = pool[: max(1, int(insurance_topk))]
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if pick in winning_zodiacs else 0
+        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -2350,6 +2570,7 @@ def get_recent_two_zodiac_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
     history_window: int = 16,
+    insurance_topk: int = 12,
 ) -> Dict[str, float]:
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
@@ -2363,12 +2584,16 @@ def get_recent_two_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
+        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.06)
+        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
         picks = _get_two_zodiac_from_history_rows(history_rows)
+        pool = list(picks) + [z for z in ranked if z not in picks]
+        pool = pool[: max(2, int(insurance_topk))]
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in picks) else 0
+        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -2630,8 +2855,8 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if special_conflict:
         print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
-    print(f"🎯 2生肖推荐: {zodiac_two_text}")
-    print(f"🎯 1生肖推荐: {zodiac_single_text}")
+    print(f"2生肖推荐: {zodiac_two_text}")
+    print(f"1生肖推荐: {zodiac_single_text}")
     print("=" * 50)
 
 
@@ -2683,7 +2908,7 @@ def review_latest_prediction(conn: sqlite3.Connection) -> str:
         return f"最新一期 {issue_no} 无预测记录（可能未运行预测）。"
 
     lines = []
-    lines.append(f"📊 复盘最新一期 {issue_no}（{draw_date}）")
+    lines.append(f"复盘最新一期 {issue_no}（{draw_date}）")
     lines.append(f"实际开奖: 主号 {actual_main_str}  特别号 {actual_special_str}")
     lines.append("")
     lines.append("各策略预测与命中情况：")
@@ -2697,7 +2922,9 @@ def review_latest_prediction(conn: sqlite3.Connection) -> str:
         special_hit = 1 if special == actual_special else 0
         main_str = " ".join(_fmt_num(n) for n in main6)
         special_str = _fmt_num(special) if special is not None else "--"
-        lines.append(f"  {strategy_name}: 主号 {main_str} | 特别号 {special_str} | 中主号 {hit_count}/6 | 中特别号 {'✅' if special_hit else '❌'}")
+        lines.append(
+            f"  {strategy_name}: 主号 {main_str} | 特别号 {special_str} | 中主号 {hit_count}/6 | 中特别号 {'YES' if special_hit else 'NO'}"
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -2798,17 +3025,17 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
             content = (
                 f"【香港六合彩·{issue_no}期推荐】\n"
-                f"🎯 2生肖推荐：{zodiac_two_text}\n"
-                f"🎯 1生肖推荐：{zodiac_single_text}\n"
-                f"🔮 特别号主推：{special_text}{conflict_tip}\n"
-                f"🛡 特别号防守：{defense_text}\n"
-                f"🔥 六策略极强号：{strong_special_text}（{strong_zodiac_text}）\n"
-                f"🧩 六策略特别号组：{strategy_special_text}\n"
-                f"🧬 六策略生肖组：{strategy_zodiac_text}\n"
-                f"📊 特别号综合汇总（各策略去重）：{all_specials_str}\n"
-                f"⭐ 最终投票特别号（前三热门）：{top_special_str}\n"
-                f"🏆 三中三预测（综合20码池+动态权重）：{trio_str}\n"
-                f"📊 详情请运行 python hk_marksix.py show"
+                f"2生肖推荐：{zodiac_two_text}\n"
+                f"1生肖推荐：{zodiac_single_text}\n"
+                f"特别号主推：{special_text}{conflict_tip}\n"
+                f"特别号防守：{defense_text}\n"
+                f"六策略极强号：{strong_special_text}（{strong_zodiac_text}）\n"
+                f"六策略特别号组：{strategy_special_text}\n"
+                f"六策略生肖组：{strategy_zodiac_text}\n"
+                f"特别号综合汇总（各策略去重）：{all_specials_str}\n"
+                f"最终投票特别号（前三热门）：{top_special_str}\n"
+                f"三中三预测（综合20码池+动态权重）：{trio_str}\n"
+                f"详情请运行 python marksix_local.py show"
             )
             send_pushplus_notification(f"香港六合彩预测 {issue_no}", content)
 
