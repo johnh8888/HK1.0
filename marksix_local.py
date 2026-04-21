@@ -1025,19 +1025,20 @@ def _generate_special_number_v4(
     issue_no: str
 ) -> Tuple[int, float, List[int]]:
     """
-    特别号生成增强版 v4.1
-    - 策略加权投票（近期动量权重大幅提升）
-    - 长期遗漏特别号强力回补
-    - 主号与特别号同尾、邻号、同生肖关联加分
+    特别号生成增强版 v4.2
+    - 策略加权投票（近期动量权重大幅提升至1.8）
+    - 长期遗漏特别号强力回补（系数增强）
+    - 主号与特别号同尾、邻号、同生肖关联加分（权重提高）
     - 生肖周期冷热预测
+    - 尾数冷热分析（新增特别号尾数遗漏加分）
     - 奇偶趋势反向选择
     """
     special_votes = []
     vote_weights = {}
     
-    # 各策略特别号权重系数（基于历史命中率表现）
+    # 各策略特别号权重系数（基于历史命中率表现，近期动量一骑绝尘）
     strategy_special_weights = {
-        "momentum_v1": 1.4,      # 近期动量特别号表现最佳
+        "momentum_v1": 1.8,      # 提升至1.8
         "hot_cold_mix_v1": 1.2,
         "ensemble_v2": 1.1,
         "hot_v1": 1.0,
@@ -1071,9 +1072,15 @@ def _generate_special_number_v4(
     least_zodiac = min(zodiac_counter, key=lambda z: zodiac_counter[z], default="马")
     predicted_zodiac_numbers = ZODIAC_MAP.get(least_zodiac, [1, 13, 25, 37, 49])
 
-    # 尾数冷热分析
+    # 尾数冷热分析（最近20期）
     tail_counter = Counter([n % 10 for n in recent_specials[:20]])
     coldest_tail = min(tail_counter, key=lambda t: tail_counter[t], default=0)
+    
+    # 特别号尾数遗漏计算（独立于号码遗漏）
+    tail_omission = {t: 20 for t in range(10)}
+    for i, sp in enumerate(recent_specials[:20]):
+        tail_omission[sp % 10] = min(tail_omission.get(sp % 10, 20), i + 1)
+    coldest_tail_by_omit = max(tail_omission, key=lambda t: tail_omission[t])
 
     main_set = set(main_pool)
     scores = {}
@@ -1090,9 +1097,9 @@ def _generate_special_number_v4(
         # 2. 遗漏值加分（长期未出特别号强力回补）
         omit_val = omission.get(n, 60)
         if omit_val >= 20:
-            score += min(7.0, omit_val / 5.0)
+            score += min(8.0, omit_val / 4.0)   # 强化
         elif omit_val >= 10:
-            score += omit_val / 4.0
+            score += omit_val / 3.5
         else:
             score += omit_val / 7.0
         
@@ -1106,23 +1113,25 @@ def _generate_special_number_v4(
         if n in predicted_zodiac_numbers:
             score += 2.8
         
-        # 5. 尾数冷态加分
+        # 5. 尾数冷态加分（号码尾数+特别号尾数遗漏双重加分）
         if n % 10 == coldest_tail:
-            score += 2.2
+            score += 2.5
+        if n % 10 == coldest_tail_by_omit:
+            score += 2.5
         
-        # 6. 与主号的关联特征
+        # 6. 与主号的关联特征（强化同尾、邻号）
         for mn in main_pool:
             # 同尾
             if n % 10 == mn % 10:
-                score += 2.5
+                score += 3.5   # 大幅提升
             # 邻号
             diff = abs(n - mn)
             if diff == 1:
-                score += 2.8
+                score += 3.8   # 大幅提升
             elif diff == 2:
-                score += 2.0
+                score += 2.2
             elif diff == 3:
-                score += 1.3
+                score += 1.4
             # 同生肖
             if get_zodiac_by_number(n) == get_zodiac_by_number(mn):
                 score += 1.8
@@ -1132,26 +1141,30 @@ def _generate_special_number_v4(
         if len(recent_parity) >= 5:
             odd_ratio = sum(recent_parity) / len(recent_parity)
             if odd_ratio > 0.65 and n % 2 == 0:
-                score += 1.8
+                score += 2.0
             elif odd_ratio < 0.35 and n % 2 == 1:
-                score += 1.8
+                score += 2.0
         
         scores[n] = score
 
     # 按得分排序
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     best = ranked[0][0]
-    confidence = min(1.0, ranked[0][1] / 28.0)
+    confidence = min(1.0, ranked[0][1] / 30.0)  # 调整归一化分母
     
-    # 生成防守号码（不与主号冲突）
+    # 生成防守号码（不与主号冲突，且尽量与主号不同尾）
     defenses = []
+    main_tails = {mn % 10 for mn in main_pool}
     for n, s in ranked[1:]:
         if n not in main_set and n != best:
+            # 优先选择与主号尾数不同的防守号（增加多样性）
+            if len(defenses) < 2 and (n % 10) in main_tails:
+                continue  # 跳过同尾过多的候选
             defenses.append(n)
             if len(defenses) >= 3:
                 break
     
-    # 补足防守号（理论上不会缺，但确保完整性）
+    # 补足防守号
     while len(defenses) < 3:
         for n, s in ranked:
             if n not in defenses and n != best and n not in main_set:
