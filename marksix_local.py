@@ -12,7 +12,7 @@ import socket
 import sqlite3
 import time
 from urllib.error import URLError
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import combinations
@@ -20,65 +20,65 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
-# ==================== 常量配置 ====================
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "hk_marksix.db")
 CSV_PATH_DEFAULT = str(SCRIPT_DIR / "HK_Mark_Six.csv")
 
+# 香港数据源（使用 marksix6.net API 中的“香港彩”）
 HK_API_URL = "https://marksix6.net/index.php?api=1"
 API_TIMEOUT_DEFAULT = 20
 API_RETRIES_DEFAULT = 4
 API_RETRY_BACKOFF_SECONDS = 2.0
 
-MINED_CONFIG_KEY = "mined_strategy_config_v2"
+MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
 
-# 基础窗口配置（进一步扩大以捕捉长周期）
-FEATURE_WINDOW_DEFAULT = 14
+# ==================== 【优化后常量】 ====================
+FEATURE_WINDOW_DEFAULT = 12  # 从10提高到12，捕捉更长周期
 
 STRATEGY_BASE_WINDOWS = {
-    "hot_v1": 10,
-    "momentum_v1": 11,
-    "cold_rebound_v1": 16,
-    "balanced_v1": 14,
-    "pattern_mined_v1": 10,
-    "ensemble_v3": 14,
-    "hot_cold_mix_v1": 12,
-    "smart_rotate_v1": 12,   # 新增智能轮动
+    "hot_v1": 8,
+    "momentum_v1": 9,
+    "cold_rebound_v1": 14,
+    "balanced_v1": 12,
+    "pattern_mined_v1": 8,
+    "ensemble_v2": 12,
+    "hot_cold_mix_v1": 10,   # 新增热冷混合策略
 }
 
-WEIGHT_WINDOW_DEFAULT = 36
-HEALTH_WINDOW_DEFAULT = 20
-BACKTEST_ISSUES_DEFAULT = 150
+WEIGHT_WINDOW_DEFAULT = 30
+HEALTH_WINDOW_DEFAULT = 18
+BACKTEST_ISSUES_DEFAULT = 120
 
-ENSEMBLE_DIVERSITY_BONUS = 0.15
-BIAS_THRESHOLD = 0.60
-BIAS_ADJUSTMENT = 0.45
+# Ensemble v3.1 配置
+ENSEMBLE_DIVERSITY_BONUS = 0.13
+
+# 偏态检测阈值（已调整）
+BIAS_THRESHOLD = 0.65
+BIAS_ADJUSTMENT = 0.40
+FORCED_BIAS_COEFFICIENT = 0.75
 
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
     "hot_v1": "热号策略",
     "cold_rebound_v1": "冷号回补",
     "momentum_v1": "近期动量",
-    "ensemble_v3": "集成投票",
+    "ensemble_v2": "集成投票",
     "pattern_mined_v1": "规律挖掘",
-    "hot_cold_mix_v1": "热冷混合",
-    "smart_rotate_v1": "智能轮动",
+    "hot_cold_mix_v1": "热冷混合",  # 新增
 }
 STRATEGY_IDS = [
     "balanced_v1",
     "hot_v1",
     "cold_rebound_v1",
     "momentum_v1",
-    "ensemble_v3",
+    "ensemble_v2",
     "pattern_mined_v1",
-    "hot_cold_mix_v1",
-    "smart_rotate_v1",
+    "hot_cold_mix_v1",  # 新增
 ]
 SPECIAL_ANALYSIS_ORDER = [
     "pattern_mined_v1",
-    "ensemble_v3",
-    "smart_rotate_v1",
+    "ensemble_v2",
     "momentum_v1",
     "cold_rebound_v1",
     "hot_v1",
@@ -86,6 +86,7 @@ SPECIAL_ANALYSIS_ORDER = [
     "hot_cold_mix_v1",
 ]
 
+# 生肖映射
 ZODIAC_MAP = {
     "马": [1, 13, 25, 37, 49],
     "蛇": [2, 14, 26, 38],
@@ -101,12 +102,14 @@ ZODIAC_MAP = {
     "羊": [12, 24, 36, 48],
 }
 
-PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
+PUSHPLUS_TOKEN = ""
+if os.environ.get("PUSHPLUS_TOKEN"):
+    PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
 
 _WEIGHT_PROTECTION_PRINTED: set[str] = set()
 _PROTECTION_PRINT_COUNTER = 0
 
-# ==================== 数据结构 ====================
+
 @dataclass
 class DrawRecord:
     issue_no: str
@@ -119,7 +122,6 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ==================== 数据库操作 ====================
 def connect_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -138,6 +140,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
         CREATE TABLE IF NOT EXISTS prediction_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             issue_no TEXT NOT NULL,
@@ -156,6 +159,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             reviewed_at TEXT,
             UNIQUE(issue_no, strategy)
         );
+
         CREATE TABLE IF NOT EXISTS prediction_picks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id INTEGER NOT NULL,
@@ -167,6 +171,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             UNIQUE(run_id, number),
             FOREIGN KEY(run_id) REFERENCES prediction_runs(id) ON DELETE CASCADE
         );
+
         CREATE TABLE IF NOT EXISTS prediction_pools (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id INTEGER NOT NULL,
@@ -176,11 +181,13 @@ def init_db(conn: sqlite3.Connection) -> None:
             UNIQUE(run_id, pool_size),
             FOREIGN KEY(run_id) REFERENCES prediction_runs(id) ON DELETE CASCADE
         );
+
         CREATE TABLE IF NOT EXISTS model_state (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
         CREATE TABLE IF NOT EXISTS strategy_performance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             issue_no TEXT NOT NULL,
@@ -206,12 +213,18 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE prediction_picks ADD COLUMN pick_type TEXT NOT NULL DEFAULT 'MAIN'")
     if not _column_exists(conn, "prediction_runs", "special_hit"):
         conn.execute("ALTER TABLE prediction_runs ADD COLUMN special_hit INTEGER")
-    for col in ["hit_count_10", "hit_count_14", "hit_count_20"]:
-        if not _column_exists(conn, "prediction_runs", col):
-            conn.execute(f"ALTER TABLE prediction_runs ADD COLUMN {col} INTEGER")
-    for col in ["hit_rate_10", "hit_rate_14", "hit_rate_20"]:
-        if not _column_exists(conn, "prediction_runs", col):
-            conn.execute(f"ALTER TABLE prediction_runs ADD COLUMN {col} REAL")
+    if not _column_exists(conn, "prediction_runs", "hit_count_10"):
+        conn.execute("ALTER TABLE prediction_runs ADD COLUMN hit_count_10 INTEGER")
+    if not _column_exists(conn, "prediction_runs", "hit_rate_10"):
+        conn.execute("ALTER TABLE prediction_runs ADD COLUMN hit_rate_10 REAL")
+    if not _column_exists(conn, "prediction_runs", "hit_count_14"):
+        conn.execute("ALTER TABLE prediction_runs ADD COLUMN hit_count_14 INTEGER")
+    if not _column_exists(conn, "prediction_runs", "hit_rate_14"):
+        conn.execute("ALTER TABLE prediction_runs ADD COLUMN hit_rate_14 REAL")
+    if not _column_exists(conn, "prediction_runs", "hit_count_20"):
+        conn.execute("ALTER TABLE prediction_runs ADD COLUMN hit_count_20 INTEGER")
+    if not _column_exists(conn, "prediction_runs", "hit_rate_20"):
+        conn.execute("ALTER TABLE prediction_runs ADD COLUMN hit_rate_20 REAL")
 
 
 def get_model_state(conn: sqlite3.Connection, key: str) -> Optional[str]:
@@ -231,7 +244,6 @@ def set_model_state(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
-# ==================== 数据解析与同步 ====================
 def _pick(row: Dict[str, str], keys: Sequence[str]) -> str:
     for k in keys:
         if k in row and str(row[k]).strip():
@@ -273,8 +285,62 @@ def parse_draw_csv(csv_path: str) -> List[DrawRecord]:
     path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    records: List[DrawRecord] = []
     with path.open("r", encoding="utf-8-sig", newline="") as f:
-        return parse_draw_csv_text(f.read())
+        reader = csv.DictReader(f)
+        for raw in reader:
+            row = {k.strip(): (v or "").strip() for k, v in raw.items() if k}
+            issue_no = _pick(row, ["期号", "期數", "issueNo", "issue_no"])
+            draw_date = _parse_date(_pick(row, ["日期", "date", "drawDate", "draw_date"]))
+            special = _pick(row, ["特别号码", "特別號碼", "special", "specialNumber", "no7", "n7"])
+
+            numbers = _parse_numbers(_pick(row, ["中奖号码", "中獎號碼", "numbers", "result"]))
+            if len(numbers) != 6:
+                split_keys = ["中奖号码 1", "中獎號碼 1", "1"], ["2"], ["3"], ["4"], ["5"], ["6"]
+                split_nums: List[int] = []
+                ok = True
+                for key_group in split_keys:
+                    value = _pick(row, list(key_group))
+                    if not value:
+                        ok = False
+                        break
+                    try:
+                        n = int(value)
+                    except ValueError:
+                        ok = False
+                        break
+                    if not (1 <= n <= 49):
+                        ok = False
+                        break
+                    split_nums.append(n)
+                if ok:
+                    numbers = split_nums
+
+            try:
+                special_n = int(special)
+            except ValueError:
+                continue
+
+            if not issue_no or not draw_date:
+                continue
+            if len(numbers) != 6 or not (1 <= special_n <= 49):
+                continue
+
+            records.append(
+                DrawRecord(
+                    issue_no=issue_no,
+                    draw_date=draw_date,
+                    numbers=numbers,
+                    special_number=special_n,
+                )
+            )
+
+    records.sort(key=lambda r: (r.draw_date, r.issue_no))
+    dedup: Dict[str, DrawRecord] = {}
+    for r in records:
+        dedup[r.issue_no] = r
+    return sorted(dedup.values(), key=lambda r: (r.draw_date, r.issue_no))
 
 
 def parse_draw_csv_text(csv_text: str) -> List[DrawRecord]:
@@ -579,10 +645,9 @@ def load_recent_draws(conn: sqlite3.Connection, limit: int = 3) -> List[List[int
     return [json.loads(r["numbers_json"]) for r in rows]
 
 
-# ==================== 特征计算（增强版） ====================
 def _normalize(score_map: Dict[int, float]) -> Dict[int, float]:
-    vals = list(score_map.values())
-    mn, mx = min(vals), max(vals)
+    values = list(score_map.values())
+    mn, mx = min(values), max(values)
     if mx == mn:
         return {k: 0.0 for k in score_map}
     return {k: (v - mn) / (mx - mn) for k, v in score_map.items()}
@@ -643,124 +708,94 @@ def _zone_heat_map(draws: List[List[int]], window: int = 3) -> Dict[int, float]:
     return {n: zone_score[min(4, (n - 1) // 10)] for n in ALL_NUMBERS}
 
 
-def _tail_freq_map(draws: List[List[int]]) -> Dict[int, float]:
-    """尾数频率特征（原始值，后续归一化）"""
-    tail_freq = {n: 0.0 for n in ALL_NUMBERS}
-    for draw in draws:
-        for n in draw:
-            tail_freq[n] += 1.0
-    return tail_freq
-
-
-def _span_preference(draws: List[List[int]]) -> float:
-    """最近平均跨度"""
-    spans = [max(d) - min(d) for d in draws if d]
-    return sum(spans) / len(spans) if spans else 30.0
-
-
-# ==================== 组合优化：迭代改进 ====================
-def _pick_top_six_iterative(
-    scores: Dict[int, float],
-    reason: str,
-    draws_context: Optional[List[List[int]]] = None
-) -> List[Tuple[int, int, float, str]]:
+def _pick_top_six_optimized(scores: Dict[int, float], reason: str) -> List[Tuple[int, int, float, str]]:
     """
-    迭代改进版6码筛选：初始选前6，然后尝试替换最差的一个，直至收敛。
-    约束放宽但加入尾数、跨度等软约束。
+    优化版6码筛选：放宽奇偶比、区间、和值约束。
     """
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    if len(ranked) < 6:
-        return [(n, i+1, s, reason) for i, (n, s) in enumerate(ranked)]
+    picked: List[Tuple[int, float]] = []
+    for n, s in ranked:
+        if len(picked) == 6:
+            break
+        proposal = [pn for pn, _ in picked] + [n]
+        odd_count = sum(1 for x in proposal if x % 2 == 1)
 
-    current = [n for n, _ in ranked[:6]]
-    current_scores = {n: scores[n] for n in current}
+        # 放宽奇偶比：禁止5个及以上同奇偶，而不是4个
+        if len(proposal) >= 5 and (odd_count == 0 or odd_count == len(proposal)):
+            continue
 
-    def evaluate(combo: List[int]) -> float:
-        # 基础分：分数和
-        base = sum(scores[n] for n in combo)
-        # 奇偶比惩罚
-        odd_cnt = sum(1 for x in combo if x % 2 == 1)
-        if odd_cnt == 0 or odd_cnt == 6:
-            base -= 2.0
-        elif odd_cnt == 1 or odd_cnt == 5:
-            base -= 0.5
-        # 区间惩罚：单区不超过4个
-        zone_cnt = [0]*5
-        for x in combo:
-            zone_cnt[min(4, (x-1)//10)] += 1
-        if any(c >= 5 for c in zone_cnt):
-            base -= 3.0
-        elif any(c == 4 for c in zone_cnt):
-            base -= 1.0
-        # 跨度偏好（软）
-        span = max(combo) - min(combo)
-        if draws_context:
-            avg_span = _span_preference(draws_context)
-            if span < avg_span - 15 or span > avg_span + 15:
-                base -= 0.8
-        # 和值范围（80-220）
-        total = sum(combo)
-        if total < 80 or total > 220:
-            base -= 2.0
-        elif total < 95 or total > 205:
-            base -= 0.5
-        return base
+        # 区间约束：禁止同一区间≥5个
+        zone_counts: Dict[int, int] = {}
+        for x in proposal:
+            z = min(4, (x - 1) // 10)
+            zone_counts[z] = zone_counts.get(z, 0) + 1
+        if any(c >= 5 for c in zone_counts.values()):
+            continue
 
-    best_combo = current[:]
-    best_score = evaluate(best_combo)
-    improved = True
-    max_iter = 10
-    while improved and max_iter > 0:
-        improved = False
-        max_iter -= 1
-        # 找出当前组合中评分最低的号码
-        min_idx = min(range(6), key=lambda i: scores[current[i]])
-        # 尝试用候选池中排名靠前但不在当前组合中的号码替换
-        for alt_n, alt_s in ranked[:30]:
-            if alt_n in current:
-                continue
-            candidate = current[:]
-            candidate[min_idx] = alt_n
-            cand_score = evaluate(candidate)
-            if cand_score > best_score:
-                best_combo = candidate[:]
-                best_score = cand_score
-                improved = True
-        current = best_combo[:]
+        picked.append((n, s))
 
-    final = []
-    for idx, n in enumerate(best_combo):
-        final.append((n, idx+1, scores[n], f"{reason} score={scores[n]:.4f}"))
-    return final
+    # 补充不足6个（理论上不会，但以防万一）
+    while len(picked) < 6:
+        for n, s in ranked:
+            if n not in [pn for pn, _ in picked]:
+                picked.append((n, s))
+                break
+
+    # 和值范围放宽至 80~220
+    target_low, target_high = 80, 220
+    top6 = [n for n, _ in picked[:6]]
+    total = sum(top6)
+    if not (target_low <= total <= target_high):
+        # 尝试替换一个号码
+        for i in range(5, -1, -1):
+            replaced = False
+            for alt_n, alt_s in ranked:
+                if alt_n in top6:
+                    continue
+                candidate = list(top6)
+                candidate[i] = alt_n
+                csum = sum(candidate)
+                if target_low <= csum <= target_high:
+                    picked[i] = (alt_n, alt_s)
+                    top6 = candidate
+                    replaced = True
+                    break
+            if replaced:
+                break
+
+    return [(n, idx + 1, s, f"{reason} score={s:.4f}") for idx, (n, s) in enumerate(picked)]
 
 
-# ==================== 策略核心函数（增强版） ====================
 def _default_mined_config() -> Dict[str, float]:
     return {
-        "window": 8.0,
+        "window": 6.0,
         "w_freq": 0.30,
-        "w_omit": 0.45,
-        "w_mom": 0.25,
+        "w_omit": 0.50,
+        "w_mom": 0.20,
         "w_pair": 0.00,
-        "w_zone": 0.05,
-        "w_tail": 0.05,
+        "w_zone": 0.10,
         "special_bonus": 0.10,
     }
 
 
 def _candidate_mined_configs() -> List[Dict[str, float]]:
-    windows = [8, 10, 12, 14]
+    windows = [6, 9, 12, 18]
     weight_triplets = [
-        (0.40, 0.35, 0.25),
+        (0.50, 0.30, 0.20),
+        (0.45, 0.35, 0.20),
+        (0.40, 0.40, 0.20),
         (0.35, 0.45, 0.20),
+        (0.30, 0.50, 0.20),
+        (0.60, 0.20, 0.20),
+        (0.20, 0.60, 0.20),
+        (0.40, 0.30, 0.30),
         (0.30, 0.40, 0.30),
-        (0.25, 0.50, 0.25),
-        (0.45, 0.30, 0.25),
     ]
     pair_zone_sets = [
-        (0.00, 0.05),
+        (0.00, 0.00),
         (0.05, 0.05),
         (0.10, 0.00),
+        (0.00, 0.10),
     ]
     out: List[Dict[str, float]] = []
     for w in windows:
@@ -774,34 +809,30 @@ def _candidate_mined_configs() -> List[Dict[str, float]]:
                         "w_mom": wm,
                         "w_pair": wp,
                         "w_zone": wz,
-                        "w_tail": 0.05,
                         "special_bonus": 0.10,
                     }
                 )
     return out
 
 
-def _apply_weight_config_enhanced(
+def _apply_weight_config(
     draws: List[List[int]],
     config: Dict[str, float],
     reason: str,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
     window_size = int(config.get("window", FEATURE_WINDOW_DEFAULT))
-    window = draws[:max(3, window_size)]
-
+    window = draws[: max(3, window_size)]
     freq = _normalize(_freq_map(window))
     omission = _normalize(_omission_map(window))
     momentum = _normalize(_momentum_map(window))
     pair = _normalize(_pair_affinity_map(window, window=min(3, len(window))))
     zone = _normalize(_zone_heat_map(window, window=min(3, len(window))))
-    tail = _normalize(_tail_freq_map(window))
 
-    w_freq = float(config.get("w_freq", 0.35))
-    w_omit = float(config.get("w_omit", 0.40))
+    w_freq = float(config.get("w_freq", 0.45))
+    w_omit = float(config.get("w_omit", 0.35))
     w_mom = float(config.get("w_mom", 0.20))
     w_pair = float(config.get("w_pair", 0.00))
-    w_zone = float(config.get("w_zone", 0.05))
-    w_tail = float(config.get("w_tail", 0.05))
+    w_zone = float(config.get("w_zone", 0.00))
 
     scores: Dict[int, float] = {}
     for n in ALL_NUMBERS:
@@ -811,10 +842,9 @@ def _apply_weight_config_enhanced(
             + momentum[n] * w_mom
             + pair[n] * w_pair
             + zone[n] * w_zone
-            + tail[n] * w_tail
         )
 
-    main_picks = _pick_top_six_iterative(scores, reason, draws_context=window)
+    main_picks = _pick_top_six_optimized(scores, reason)
     main_set = {n for n, _, _, _ in main_picks}
     special_candidates = [(n, s) for n, s in sorted(scores.items(), key=lambda x: x[1], reverse=True) if n not in main_set]
     if not special_candidates:
@@ -824,14 +854,14 @@ def _apply_weight_config_enhanced(
 
 
 def mine_pattern_config_from_rows(rows: Sequence[sqlite3.Row]) -> Dict[str, float]:
-    if len(rows) < 5:
+    if len(rows) < 3:
         return _default_mined_config()
 
     candidates = _candidate_mined_configs()
     best_cfg = _default_mined_config()
     best_score = -1.0
 
-    min_history = 5
+    min_history = 3
     eval_span = min(500, len(rows) - min_history)
     start = max(min_history, len(rows) - eval_span)
 
@@ -846,7 +876,7 @@ def mine_pattern_config_from_rows(rows: Sequence[sqlite3.Row]) -> Dict[str, floa
             history_desc = [parsed_main[j] for j in range(i - 1, hist_start - 1, -1)]
             if len(history_desc) < min_history:
                 continue
-            picks, special, _, _ = _apply_weight_config_enhanced(history_desc, cfg, "规律挖掘")
+            picks, special, _, _ = _apply_weight_config(history_desc, cfg, "规律挖掘")
             picked_main = [n for n, _, _, _ in picks]
             win_main = set(parsed_main[i])
             hit_count = len([n for n in picked_main if n in win_main])
@@ -882,51 +912,114 @@ def ensure_mined_pattern_config(conn: sqlite3.Connection, force: bool = False) -
     return cfg
 
 
-# ==================== 智能轮动策略 ====================
-def _smart_rotate_strategy(
-    draws: List[List[int]],
-    window: int = 12
-) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    """
-    根据近期冷热周期自动切换策略：
-    - 若近期热号连续出现比例高 -> 追热
-    - 若冷号遗漏严重 -> 守冷
-    - 否则均衡
-    """
-    recent = draws[:window]
-    if len(recent) < 6:
-        return _apply_weight_config_enhanced(
-            recent,
-            {"window": float(window), "w_freq": 0.35, "w_omit": 0.40, "w_mom": 0.25, "w_tail": 0.05},
-            "智能轮动(均衡)"
+def _rank_vote_score(score_maps: Sequence[Dict[int, float]]) -> Dict[int, float]:
+    votes = {n: 0.0 for n in ALL_NUMBERS}
+    for m in score_maps:
+        ranked = sorted(m.items(), key=lambda x: x[1], reverse=True)
+        for rank, (n, _) in enumerate(ranked):
+            votes[n] += float(49 - rank)
+    return _normalize(votes)
+
+
+def _build_candidate_pools(scores: Dict[int, float], main6: List[int]) -> Dict[int, List[int]]:
+    ranked = [n for n, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
+    main_unique = []
+    for n in main6:
+        if n not in main_unique:
+            main_unique.append(n)
+
+    rest = [n for n in ranked if n not in main_unique]
+    pool10 = main_unique + rest[: max(0, 10 - len(main_unique))]
+    pool14 = main_unique + rest[: max(0, 14 - len(main_unique))]
+    pool20 = main_unique + rest[: max(0, 20 - len(main_unique))]
+    return {6: main_unique[:6], 10: pool10[:10], 14: pool14[:14], 20: pool20[:20]}
+
+
+def _pool_hit_count(pool_numbers: Sequence[int], winning: set[int]) -> int:
+    return len([n for n in pool_numbers if n in winning])
+
+
+def _save_prediction_pools(conn: sqlite3.Connection, run_id: int, pools: Dict[int, List[int]]) -> None:
+    conn.execute("DELETE FROM prediction_pools WHERE run_id = ?", (run_id,))
+    now = utc_now()
+    for pool_size, numbers in pools.items():
+        conn.execute(
+            """
+            INSERT INTO prediction_pools(run_id, pool_size, numbers_json, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (run_id, int(pool_size), json.dumps(numbers), now),
         )
 
-    # 热号集中度
-    flat = [n for d in recent[:6] for n in d]
-    freq = Counter(flat)
-    top10_hits = sum(cnt for _, cnt in freq.most_common(10))
-    hot_concentration = top10_hits / (6 * 6)
 
-    # 冷号平均遗漏
-    omission = _omission_map(recent)
-    cold_omissions = sorted([(n, omission[n]) for n in ALL_NUMBERS], key=lambda x: -x[1])[:10]
-    avg_cold_omit = sum(o for _, o in cold_omissions) / 10
+def get_pool_numbers_for_run(conn: sqlite3.Connection, run_id: int, pool_size: int = 6) -> List[int]:
+    row = conn.execute(
+        "SELECT numbers_json FROM prediction_pools WHERE run_id = ? AND pool_size = ?",
+        (run_id, int(pool_size)),
+    ).fetchone()
+    if not row:
+        return []
+    try:
+        nums = json.loads(row["numbers_json"])
+    except Exception:
+        return []
+    valid_numbers: List[int] = []
+    for n in nums:
+        if isinstance(n, int) and 1 <= n <= 49:
+            valid_numbers.append(n)
+            continue
+        if isinstance(n, str) and n.isdigit():
+            parsed = int(n)
+            if 1 <= parsed <= 49:
+                valid_numbers.append(parsed)
+    return valid_numbers
 
-    if hot_concentration > 0.65:
-        config = {"window": float(window), "w_freq": 0.70, "w_omit": 0.10, "w_mom": 0.20, "w_tail": 0.05}
-        reason = "智能轮动(追热)"
-    elif avg_cold_omit > 12:
-        config = {"window": float(window), "w_freq": 0.10, "w_omit": 0.65, "w_mom": 0.25, "w_tail": 0.05}
-        reason = "智能轮动(守冷)"
-    else:
-        config = {"window": float(window), "w_freq": 0.35, "w_omit": 0.40, "w_mom": 0.25, "w_tail": 0.05}
-        reason = "智能轮动(均衡)"
 
-    return _apply_weight_config_enhanced(recent, config, reason)
+def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int:
+    base = STRATEGY_BASE_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT)
+    health = get_strategy_health(conn, window=20)
+    h = health.get(strategy, {})
+    recent_avg = float(h.get("recent_avg_hit", 0.65))
+    cold_streak = int(h.get("cold_streak", 0))
+
+    if recent_avg >= 0.95:
+        return max(6, base - 2)
+    elif recent_avg >= 0.80:
+        return max(7, base - 1)
+    elif recent_avg <= 0.55 or cold_streak >= 4:
+        return min(16, base + 3)
+    elif recent_avg <= 0.65:
+        return min(14, base + 2)
+    return base
 
 
-# ==================== 特别号增强版 ====================
-def _generate_special_number_enhanced(
+def detect_bias(conn: sqlite3.Connection, window: int = 10) -> Tuple[float, Dict[str, float]]:
+    """强制偏态模式：固定偏态系数 0.75"""
+    return 0.75, {
+        "forced": True,
+        "zone_bias": 0.75,
+        "parity_bias": 0.70,
+        "hot_cold_bias": 0.70,
+        "zone_dist": [0]*5,
+        "odd_ratio": 0.5
+    }
+
+
+def adjust_weights_for_bias(weights: Dict[str, float], bias_score: float) -> Dict[str, float]:
+    if bias_score < BIAS_THRESHOLD:
+        return weights
+    adjusted = weights.copy()
+    cold_boost = 1 + BIAS_ADJUSTMENT * bias_score
+    adjusted["cold_rebound_v1"] = weights.get("cold_rebound_v1", 0.15) * cold_boost
+    adjusted["hot_v1"] = weights.get("hot_v1", 0.15) * (1 - BIAS_ADJUSTMENT * bias_score * 0.7)
+    adjusted["momentum_v1"] = weights.get("momentum_v1", 0.15) * (1 - BIAS_ADJUSTMENT * bias_score * 0.5)
+    total = sum(adjusted.values())
+    if total > 0:
+        adjusted = {k: v / total for k, v in adjusted.items()}
+    return adjusted
+
+
+def _generate_special_number_v4(
     conn: sqlite3.Connection,
     main_pool: List[int],
     issue_no: str
@@ -951,7 +1044,6 @@ def _generate_special_number_enhanced(
     for i, num in enumerate(recent_specials):
         omission[num] = min(omission.get(num, 60), i + 1)
 
-    # 生肖周期
     zodiac_cycle = [get_zodiac_by_number(sp) for sp in recent_specials[:24]]
     if len(zodiac_cycle) >= 6:
         recent_zodiacs = zodiac_cycle[:6]
@@ -961,21 +1053,10 @@ def _generate_special_number_enhanced(
     else:
         predicted_zodiac_numbers = ALL_NUMBERS
 
-    # 尾数冷热
     tail_counter = Counter([n % 10 for n in recent_specials[:20]])
     coldest_tail = min(tail_counter.keys(), key=lambda t: tail_counter[t]) if tail_counter else 0
 
-    # 主号差值分布
-    diff_counts = Counter()
-    recent_draws = load_recent_draws(conn, 30)
-    for i, draw in enumerate(recent_draws):
-        if i < len(recent_specials):
-            sp = recent_specials[i]
-            for m in draw:
-                diff_counts[abs(sp - m)] += 1
-    total_diffs = sum(diff_counts.values())
-    diff_weights = {d: c / total_diffs if total_diffs else 0 for d, c in diff_counts.items()}
-
+    main_zones_set = {(m - 1) // 10 for m in main_pool}
     main_set = set(main_pool)
     scores = {}
 
@@ -999,15 +1080,37 @@ def _generate_special_number_enhanced(
             score += 1.2
         for mn in main_pool:
             diff = abs(n - mn)
-            score += diff_weights.get(diff, 0) * 2.0
+            if diff == 1:
+                score += 2.0
+            elif diff == 2:
+                score += 1.5
+            elif diff == 3:
+                score += 1.0
+            elif n % 10 == mn % 10 and n != mn:
+                score += 0.8
+        n_zone = (n - 1) // 10
+        if n_zone in main_zones_set:
+            score += 1.2
+        recent_parity = [sp % 2 for sp in recent_specials[:5]]
+        if len(recent_parity) >= 3:
+            odd_ratio = sum(recent_parity) / len(recent_parity)
+            if odd_ratio > 0.6 and n % 2 == 0:
+                score += 1.0
+            elif odd_ratio < 0.4 and n % 2 == 1:
+                score += 1.0
         scores[n] = score
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     best = ranked[0][0]
-    confidence = min(1.0, ranked[0][1] / 20)
-    defenses = [n for n, _ in ranked[1:4] if n not in main_set]
+    confidence = min(1.0, ranked[0][1] / 18)
+    defenses = []
+    for n, s in ranked[1:]:
+        if n not in main_set and n != best:
+            defenses.append(n)
+            if len(defenses) >= 3:
+                break
     while len(defenses) < 3:
-        for n, _ in ranked:
+        for n, s in ranked:
             if n not in defenses and n != best and n not in main_set:
                 defenses.append(n)
                 break
@@ -1015,33 +1118,89 @@ def _generate_special_number_enhanced(
     return best, round(confidence, 3), defenses[:3]
 
 
-# ==================== 集成策略 v3 增强版 ====================
-def detect_bias(conn: sqlite3.Connection, window: int = 12) -> Tuple[float, Dict[str, float]]:
-    # 简化偏态检测，返回固定值保持兼容
-    return 0.5, {"forced": False}
+def get_trio_from_merged_pool20_v2(conn: sqlite3.Connection, issue_no: str) -> List[int]:
+    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    if not pool20 or len(pool20) < 3:
+        return [1, 2, 3]
+    all_pools = []
+    for strategy in STRATEGY_IDS:
+        run = conn.execute(
+            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
+            (issue_no, strategy)
+        ).fetchone()
+        if run:
+            p20 = get_pool_numbers_for_run(conn, run["id"], 20)
+            p20_filtered = [n for n in p20 if n in pool20]
+            all_pools.extend(p20_filtered)
+    if len(all_pools) < 3:
+        return pool20[:3]
+    appearance_count = Counter(all_pools)
+    diff_numbers = [n for n, c in appearance_count.items() if 1 <= c <= 2 and n in pool20]
+    if len(diff_numbers) < 6:
+        diff_numbers = [n for n, c in appearance_count.items() if c <= 3 and n in pool20]
+    if len(diff_numbers) < 3:
+        diff_numbers = pool20[:15]
+    draws = load_recent_draws(conn, FEATURE_WINDOW_DEFAULT)
+    if len(draws) < 3:
+        return diff_numbers[:3]
+    momentum = _momentum_map(draws)
+    freq = _freq_map(draws)
+    omission = _omission_map(draws)
+    momentum_norm = _normalize(momentum)
+    freq_norm = _normalize(freq)
+    omission_norm = _normalize(omission)
+    w_mom, w_hot, w_cold = get_trio_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
+    scores = {}
+    for n in diff_numbers[:15]:
+        score = (w_mom * momentum_norm.get(n, 0) +
+                 w_hot * freq_norm.get(n, 0) +
+                 w_cold * omission_norm.get(n, 0))
+        score += (6 - appearance_count.get(n, 3)) * 0.15
+        scores[n] = score
+    sorted_nums = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    candidates = [n for n, _ in sorted_nums[:10]]
+
+    def is_valid(trio):
+        odd_cnt = sum(1 for x in trio if x % 2 == 1)
+        total = sum(trio)
+        return 1 <= odd_cnt <= 2 and 80 <= total <= 130
+
+    for i in range(len(candidates)):
+        for j in range(i+1, len(candidates)):
+            for k in range(j+1, len(candidates)):
+                trio = (candidates[i], candidates[j], candidates[k])
+                if is_valid(trio):
+                    return list(trio)
+    for i in range(len(candidates)):
+        for j in range(i+1, len(candidates)):
+            for k in range(j+1, len(candidates)):
+                trio = (candidates[i], candidates[j], candidates[k])
+                odd_cnt = sum(1 for x in trio if x % 2 == 1)
+                if 1 <= odd_cnt <= 2:
+                    return list(trio)
+    return candidates[:3] if len(candidates) >= 3 else pool20[:3]
 
 
-def adjust_weights_for_bias(weights: Dict[str, float], bias_score: float) -> Dict[str, float]:
-    # 简化，直接返回
-    return weights
-
-
-def _ensemble_strategy_v3_enhanced(
+def _ensemble_strategy_v3_1(
     draws: List[List[int]],
     mined_config: Optional[Dict[str, float]],
     strategy_weights: Dict[str, float],
     conn: sqlite3.Connection,
     issue_no: str
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    sub_strategies = [
-        "hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1",
-        "pattern_mined_v1", "hot_cold_mix_v1", "smart_rotate_v1"
-    ]
+    sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1", "hot_cold_mix_v1"]
     score_maps = []
     sub_picks = {}
 
-    bias_score, _ = detect_bias(conn, window=12)
+    bias_score, _ = detect_bias(conn, window=10)
     adjusted_weights = adjust_weights_for_bias(strategy_weights, bias_score)
+
+    if bias_score > BIAS_THRESHOLD:
+        print(f"[集成策略] 🔥 偏态模式激活，偏态系数={bias_score:.2f} 🔥", flush=True)
+        cold_weight = adjusted_weights.get("cold_rebound_v1", 0.0)
+        print(f"   → 冷号回补当前权重: {cold_weight:.3f}", flush=True)
+    else:
+        print(f"[集成策略] 正常模式，偏态系数={bias_score:.2f}", flush=True)
 
     for sub in sub_strategies:
         win_size = get_adaptive_strategy_window(sub, conn)
@@ -1050,28 +1209,27 @@ def _ensemble_strategy_v3_enhanced(
         if sub == "pattern_mined_v1":
             cfg = mined_config or _default_mined_config()
             cfg["window"] = float(win_size)
-            _, _, _, score_map = _apply_weight_config_enhanced(sub_draws, cfg, "规律挖掘")
+            _, _, _, score_map = _apply_weight_config(sub_draws, cfg, "规律挖掘")
         elif sub == "hot_cold_mix_v1":
-            hot_cfg = {"window": float(win_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17, "w_tail": 0.05}
-            cold_cfg = {"window": float(win_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27, "w_tail": 0.05}
-            _, _, _, hot_scores = _apply_weight_config_enhanced(sub_draws, hot_cfg, "热号")
-            _, _, _, cold_scores = _apply_weight_config_enhanced(sub_draws, cold_cfg, "冷号")
+            # 热冷混合策略：分别计算热号和冷号得分，各取前50%加权融合
+            hot_config = {"window": float(win_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17}
+            cold_config = {"window": float(win_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27}
+            _, _, _, hot_scores = _apply_weight_config(sub_draws, hot_config, "热号")
+            _, _, _, cold_scores = _apply_weight_config(sub_draws, cold_config, "冷号")
             hot_norm = _normalize(hot_scores)
             cold_norm = _normalize(cold_scores)
             score_map = {n: 0.5 * hot_norm[n] + 0.5 * cold_norm[n] for n in ALL_NUMBERS}
-        elif sub == "smart_rotate_v1":
-            _, _, _, score_map = _smart_rotate_strategy(sub_draws, win_size)
         else:
             config = {"window": float(win_size)}
             if sub == "hot_v1":
-                config.update({"w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17, "w_tail": 0.05})
+                config.update({"w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17})
             elif sub == "cold_rebound_v1":
-                config.update({"w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27, "w_tail": 0.05})
+                config.update({"w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27})
             elif sub == "momentum_v1":
-                config.update({"w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83, "w_tail": 0.05})
-            else:  # balanced
-                config.update({"w_freq": 0.30, "w_omit": 0.45, "w_mom": 0.20, "w_pair": 0.05, "w_zone": 0.05, "w_tail": 0.05})
-            _, _, _, score_map = _apply_weight_config_enhanced(sub_draws, config, STRATEGY_LABELS.get(sub, sub))
+                config.update({"w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83})
+            else:  # balanced_v1 提高遗漏权重
+                config.update({"w_freq": 0.30, "w_omit": 0.40, "w_mom": 0.20, "w_pair": 0.05, "w_zone": 0.05})
+            _, _, _, score_map = _apply_weight_config(sub_draws, config, STRATEGY_LABELS.get(sub, sub))
 
         score_maps.append(score_map)
         ranked = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
@@ -1079,47 +1237,28 @@ def _ensemble_strategy_v3_enhanced(
 
     votes = {n: 0.0 for n in ALL_NUMBERS}
     for idx, sub in enumerate(sub_strategies):
-        w = adjusted_weights.get(sub, 0.15)
+        w = adjusted_weights.get(sub, 0.2)
         ranked = sorted(score_maps[idx].items(), key=lambda x: x[1], reverse=True)
         for rank, (n, _) in enumerate(ranked):
             votes[n] += w * (49 - rank)
 
-    # 随机扰动
+    # 加入小随机扰动打破同质化（固定种子保证可复现）
     seed_val = int(issue_no.replace('/', '')) if issue_no else 42
     random.seed(seed_val)
     for n in ALL_NUMBERS:
         votes[n] += random.uniform(-0.3, 0.3)
 
-    # 多样性奖励
     for n in ALL_NUMBERS:
         appear = sum(1 for p in sub_picks.values() if n in p)
-        votes[n] += (6 - appear) * ENSEMBLE_DIVERSITY_BONUS
+        votes[n] += (6 - appear) * ENSEMBLE_DIVERSITY_BONUS * 1.2
 
     voted = _normalize(votes)
-    main_picked = _pick_top_six_iterative(voted, "集成投票v3增强", draws_context=draws[:FEATURE_WINDOW_DEFAULT])
+    main_picked = _pick_top_six_optimized(voted, "集成投票v3.1")
 
     main6 = [n for n, _, _, _ in main_picked]
-    special_number, confidence, _ = _generate_special_number_enhanced(conn, main6, issue_no)
+    special_number, confidence, _ = _generate_special_number_v4(conn, main6, issue_no)
 
     return main_picked, special_number, confidence, voted
-
-
-def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int:
-    base = STRATEGY_BASE_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT)
-    health = get_strategy_health(conn, window=20)
-    h = health.get(strategy, {})
-    recent_avg = float(h.get("recent_avg_hit", 0.65))
-    cold_streak = int(h.get("cold_streak", 0))
-
-    if recent_avg >= 0.95:
-        return max(6, base - 2)
-    elif recent_avg >= 0.80:
-        return max(7, base - 1)
-    elif recent_avg <= 0.55 or cold_streak >= 4:
-        return min(16, base + 3)
-    elif recent_avg <= 0.65:
-        return min(14, base + 2)
-    return base
 
 
 def generate_strategy(
@@ -1135,56 +1274,76 @@ def generate_strategy(
     strategy_draws = draws[:window_size] if len(draws) > window_size else draws
 
     if strategy == "hot_v1":
-        config = {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17, "w_tail": 0.05}
-        return _apply_weight_config_enhanced(strategy_draws, config, "热号策略")
+        return _apply_weight_config(
+            strategy_draws,
+            {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17},
+            "热号策略"
+        )
     elif strategy == "cold_rebound_v1":
-        config = {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27, "w_tail": 0.05}
-        return _apply_weight_config_enhanced(strategy_draws, config, "冷号回补")
+        return _apply_weight_config(
+            strategy_draws,
+            {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27},
+            "冷号回补"
+        )
     elif strategy == "momentum_v1":
-        config = {"window": float(window_size), "w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83, "w_tail": 0.05}
-        return _apply_weight_config_enhanced(strategy_draws, config, "近期动量")
+        return _apply_weight_config(
+            strategy_draws,
+            {"window": float(window_size), "w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83},
+            "近期动量"
+        )
     elif strategy == "balanced_v1":
-        config = {
-            "window": float(window_size),
-            "w_freq": 0.30,
-            "w_omit": 0.45,
-            "w_mom": 0.20,
-            "w_pair": 0.05,
-            "w_zone": 0.05,
-            "w_tail": 0.05,
-        }
-        return _apply_weight_config_enhanced(strategy_draws, config, "组合策略")
+        return _apply_weight_config(
+            strategy_draws,
+            {
+                "window": float(window_size),
+                "w_freq": 0.30,
+                "w_omit": 0.40,   # 提高遗漏权重
+                "w_mom": 0.20,
+                "w_pair": 0.05,
+                "w_zone": 0.05,
+            },
+            "组合策略",
+        )
     elif strategy == "pattern_mined_v1":
         cfg = mined_config or _default_mined_config()
         cfg["window"] = float(window_size)
-        return _apply_weight_config_enhanced(strategy_draws, cfg, "规律挖掘")
+        return _apply_weight_config(strategy_draws, cfg, "规律挖掘")
     elif strategy == "hot_cold_mix_v1":
-        hot_cfg = {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17, "w_tail": 0.05}
-        cold_cfg = {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27, "w_tail": 0.05}
-        _, _, _, hot_scores = _apply_weight_config_enhanced(strategy_draws, hot_cfg, "热号")
-        _, _, _, cold_scores = _apply_weight_config_enhanced(strategy_draws, cold_cfg, "冷号")
+        # 热冷混合
+        hot_config = {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17}
+        cold_config = {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27}
+        _, _, _, hot_scores = _apply_weight_config(strategy_draws, hot_config, "热号")
+        _, _, _, cold_scores = _apply_weight_config(strategy_draws, cold_config, "冷号")
         hot_norm = _normalize(hot_scores)
         cold_norm = _normalize(cold_scores)
         mixed_scores = {n: 0.5 * hot_norm[n] + 0.5 * cold_norm[n] for n in ALL_NUMBERS}
-        main_picked = _pick_top_six_iterative(mixed_scores, "热冷混合", draws_context=strategy_draws)
+        main_picked = _pick_top_six_optimized(mixed_scores, "热冷混合")
         special_candidates = sorted(mixed_scores.items(), key=lambda x: x[1], reverse=True)
         main_set = {n for n, _, _, _ in main_picked}
         special = next((n for n, _ in special_candidates if n not in main_set), special_candidates[0][0])
         return main_picked, special, 0.0, mixed_scores
-    elif strategy == "smart_rotate_v1":
-        return _smart_rotate_strategy(strategy_draws, window_size)
     elif strategy in ("ensemble_v2", "ensemble_v3"):
         if strategy_weights is None:
             strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT) if conn else {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
         if conn is None:
-            raise ValueError("ensemble requires database connection")
+            raise ValueError("ensemble_v2/v3 requires database connection")
         if issue_no is None:
-            raise ValueError("ensemble requires issue_no parameter")
-        return _ensemble_strategy_v3_enhanced(strategy_draws, mined_config, strategy_weights, conn, issue_no)
+            raise ValueError("ensemble_v2/v3 requires issue_no parameter")
+        return _ensemble_strategy_v3_1(strategy_draws, mined_config, strategy_weights, conn, issue_no)
 
     # fallback
-    config = {"window": float(window_size), "w_freq": 0.35, "w_omit": 0.40, "w_mom": 0.25, "w_tail": 0.05}
-    return _apply_weight_config_enhanced(strategy_draws, config, "组合策略")
+    return _apply_weight_config(
+        strategy_draws,
+        {
+            "window": float(window_size),
+            "w_freq": 0.40,
+            "w_omit": 0.30,
+            "w_mom": 0.20,
+            "w_pair": 0.05,
+            "w_zone": 0.05,
+        },
+        "组合策略",
+    )
 
 
 def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = None) -> str:
@@ -1698,8 +1857,7 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 
 def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
     rows = conn.execute("""
-        SELECT strategy, AVG(main_hit_count) as avg_hit,
-               AVG(main_hit_count*main_hit_count) - AVG(main_hit_count)*AVG(main_hit_count) as var_hit
+        SELECT strategy, AVG(main_hit_count) as avg_hit
         FROM strategy_performance
         WHERE issue_no IN (
             SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?
@@ -1714,10 +1872,8 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
     for r in rows:
         strategy = str(r["strategy"])
         avg_hit = float(r["avg_hit"] or 0.0)
-        var_hit = float(r["var_hit"] or 0.0)
         if strategy in weights:
-            penalty = 1.0 / (1.0 + var_hit * 0.5)
-            weights[strategy] = max(avg_hit, baseline) * penalty
+            weights[strategy] = max(avg_hit, baseline)
 
     health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
     for strategy, h in health.items():
@@ -1727,13 +1883,14 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
         hit1_rate = float(h.get("hit1_rate", 0.0))
         cold_streak = int(h.get("cold_streak", 0))
 
+        # 平滑衰减（降低敏感度）
         shrink = 1.0
-        if recent_avg < 0.65:
-            shrink *= 0.95 ** ((0.65 - recent_avg) * 4)
-        if hit1_rate < 0.55:
+        if recent_avg < 0.7:
+            shrink *= 0.95 ** ((0.7 - recent_avg) * 5)
+        if hit1_rate < 0.52:
             shrink *= 0.92
         if cold_streak >= 3:
-            shrink *= 0.75
+            shrink *= 0.80
 
         if strategy == "pattern_mined_v1" and (cold_streak >= 2 or recent_avg < 0.6):
             shrink *= 0.60
@@ -1816,27 +1973,24 @@ def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DE
     return health
 
 
-# ==================== 生肖相关 ====================
 def get_zodiac_by_number(number: int) -> str:
     for zodiac, nums in ZODIAC_MAP.items():
         if number in nums:
             return zodiac
     return "马"
 
-
 def _get_previous_issue(conn: sqlite3.Connection, current_issue: str) -> Optional[str]:
     row = conn.execute(
         """
-        SELECT issue_no FROM draws
+        SELECT issue_no FROM draws 
         WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?)
            OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?)
-        ORDER BY draw_date DESC, issue_no DESC
+        ORDER BY draw_date DESC, issue_no DESC 
         LIMIT 1
         """,
         (current_issue, current_issue, current_issue)
     ).fetchone()
     return row["issue_no"] if row else None
-
 
 def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
     draw = conn.execute(
@@ -1853,10 +2007,10 @@ def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
 
     rows = conn.execute(
         """
-        SELECT numbers_json, special_number FROM draws
+        SELECT numbers_json, special_number FROM draws 
         WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?)
            OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?)
-        ORDER BY draw_date DESC, issue_no DESC
+        ORDER BY draw_date DESC, issue_no DESC 
         LIMIT ?
         """,
         (issue_no, issue_no, issue_no, 16)
@@ -1869,7 +2023,6 @@ def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
     picks = [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
     return any(z in winning_zodiacs for z in picks)
-
 
 def _zodiac_omission_map(rows: Sequence[sqlite3.Row]) -> Dict[str, int]:
     zodiac_omission = {z: len(rows) + 1 for z in ZODIAC_MAP.keys()}
@@ -2037,21 +2190,16 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = []
     for z in force_include:
-        if z not in picks:
-            picks.append(z)
+        if z not in picks: picks.append(z)
     for z, _ in ranked:
-        if len(picks) >= 2:
-            break
-        if z not in picks:
-            picks.append(z)
+        if len(picks) >= 2: break
+        if z not in picks: picks.append(z)
     if len(picks) < 2:
         for z, _ in ranked:
             if z not in picks:
                 picks.append(z)
-                if len(picks) == 2:
-                    break
+                if len(picks) == 2: break
     return picks[:2]
-
 
 def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     two_zodiac = _get_two_zodiac_from_history_rows(rows)
@@ -2079,7 +2227,6 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
         if candidate in two_zodiac:
             return candidate
     return ranked[0][0]
-
 
 def get_recent_single_zodiac_report(
     conn: sqlite3.Connection,
@@ -2324,128 +2471,10 @@ def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[
     return main6, pool10, pool14, pool20, special
 
 
-def get_trio_from_merged_pool20_v2(conn: sqlite3.Connection, issue_no: str) -> List[int]:
-    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-    if not pool20 or len(pool20) < 3:
-        return [1, 2, 3]
-    all_pools = []
-    for strategy in STRATEGY_IDS:
-        run = conn.execute(
-            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
-            (issue_no, strategy)
-        ).fetchone()
-        if run:
-            p20 = get_pool_numbers_for_run(conn, run["id"], 20)
-            p20_filtered = [n for n in p20 if n in pool20]
-            all_pools.extend(p20_filtered)
-    if len(all_pools) < 3:
-        return pool20[:3]
-    appearance_count = Counter(all_pools)
-    diff_numbers = [n for n, c in appearance_count.items() if 1 <= c <= 2 and n in pool20]
-    if len(diff_numbers) < 6:
-        diff_numbers = [n for n, c in appearance_count.items() if c <= 3 and n in pool20]
-    if len(diff_numbers) < 3:
-        diff_numbers = pool20[:15]
-    draws = load_recent_draws(conn, FEATURE_WINDOW_DEFAULT)
-    if len(draws) < 3:
-        return diff_numbers[:3]
-    momentum = _momentum_map(draws)
-    freq = _freq_map(draws)
-    omission = _omission_map(draws)
-    momentum_norm = _normalize(momentum)
-    freq_norm = _normalize(freq)
-    omission_norm = _normalize(omission)
-    w_mom, w_hot, w_cold = get_trio_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
-    scores = {}
-    for n in diff_numbers[:15]:
-        score = (w_mom * momentum_norm.get(n, 0) +
-                 w_hot * freq_norm.get(n, 0) +
-                 w_cold * omission_norm.get(n, 0))
-        score += (6 - appearance_count.get(n, 3)) * 0.15
-        scores[n] = score
-    sorted_nums = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    candidates = [n for n, _ in sorted_nums[:10]]
-
-    def is_valid(trio):
-        odd_cnt = sum(1 for x in trio if x % 2 == 1)
-        total = sum(trio)
-        return 1 <= odd_cnt <= 2 and 80 <= total <= 130
-
-    for i in range(len(candidates)):
-        for j in range(i+1, len(candidates)):
-            for k in range(j+1, len(candidates)):
-                trio = (candidates[i], candidates[j], candidates[k])
-                if is_valid(trio):
-                    return list(trio)
-    for i in range(len(candidates)):
-        for j in range(i+1, len(candidates)):
-            for k in range(j+1, len(candidates)):
-                trio = (candidates[i], candidates[j], candidates[k])
-                odd_cnt = sum(1 for x in trio if x % 2 == 1)
-                if 1 <= odd_cnt <= 2:
-                    return list(trio)
-    return candidates[:3] if len(candidates) >= 3 else pool20[:3]
-
-
 def get_trio_from_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
     return get_trio_from_merged_pool20_v2(conn, issue_no)
 
 
-def _pool_hit_count(pool_numbers: Sequence[int], winning: set[int]) -> int:
-    return len([n for n in pool_numbers if n in winning])
-
-
-def _save_prediction_pools(conn: sqlite3.Connection, run_id: int, pools: Dict[int, List[int]]) -> None:
-    conn.execute("DELETE FROM prediction_pools WHERE run_id = ?", (run_id,))
-    now = utc_now()
-    for pool_size, numbers in pools.items():
-        conn.execute(
-            """
-            INSERT INTO prediction_pools(run_id, pool_size, numbers_json, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (run_id, int(pool_size), json.dumps(numbers), now),
-        )
-
-
-def get_pool_numbers_for_run(conn: sqlite3.Connection, run_id: int, pool_size: int = 6) -> List[int]:
-    row = conn.execute(
-        "SELECT numbers_json FROM prediction_pools WHERE run_id = ? AND pool_size = ?",
-        (run_id, int(pool_size)),
-    ).fetchone()
-    if not row:
-        return []
-    try:
-        nums = json.loads(row["numbers_json"])
-    except Exception:
-        return []
-    valid_numbers: List[int] = []
-    for n in nums:
-        if isinstance(n, int) and 1 <= n <= 49:
-            valid_numbers.append(n)
-            continue
-        if isinstance(n, str) and n.isdigit():
-            parsed = int(n)
-            if 1 <= parsed <= 49:
-                valid_numbers.append(parsed)
-    return valid_numbers
-
-
-def _build_candidate_pools(scores: Dict[int, float], main6: List[int]) -> Dict[int, List[int]]:
-    ranked = [n for n, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
-    main_unique = []
-    for n in main6:
-        if n not in main_unique:
-            main_unique.append(n)
-
-    rest = [n for n in ranked if n not in main_unique]
-    pool10 = main_unique + rest[:max(0, 10 - len(main_unique))]
-    pool14 = main_unique + rest[:max(0, 14 - len(main_unique))]
-    pool20 = main_unique + rest[:max(0, 20 - len(main_unique))]
-    return {6: main_unique[:6], 10: pool10[:10], 14: pool14[:14], 20: pool20[:20]}
-
-
-# ==================== 最终推荐 ====================
 def get_final_recommendation(conn: sqlite3.Connection):
     row = conn.execute(
         "SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1"
@@ -2492,9 +2521,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
         return
-    (issue_no, main6, special, pool10, pool14, pool20, predict_trio,
-     special_defenses, special_conflict, zodiac_single, zodiac_two,
-     strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac) = rec
+    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = rec
     special_text = _fmt_num(special)
     p6 = " ".join(_fmt_num(n) for n in main6)
     p10 = " ".join(_fmt_num(n) for n in pool10)
@@ -2658,9 +2685,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
         if rec:
-            (issue_no, main6, special, _, _, _, predict_trio, special_defenses,
-             special_conflict, zodiac_single, zodiac_two, strategy_specials,
-             strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac) = rec
+            issue_no, main6, special, _, _, _, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two, strategy_specials, strategy_special_zodiacs, strategy_strong_special, strategy_strong_zodiac = rec
             special_text = _fmt_num(special)
             trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
             defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
@@ -2709,7 +2734,6 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             send_pushplus_notification(f"香港六合彩预测 {issue_no}", content)
 
 
-# ==================== 命令行 ====================
 def cmd_bootstrap(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
@@ -2815,7 +2839,7 @@ def cmd_mine(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="香港六合彩预测工具 - 增强版（智能轮动/迭代优化/方差惩罚）")
+    p = argparse.ArgumentParser(description="香港六合彩预测工具 - 优化版（放宽约束/新增策略/平滑权重）")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
