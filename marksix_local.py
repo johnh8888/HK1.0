@@ -3064,7 +3064,6 @@ def get_recent_single_zodiac_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
     history_window: int = 14,
-    insurance_topk: int = 12,
 ) -> Dict[str, float]:
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
@@ -3078,17 +3077,12 @@ def get_recent_single_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        # “保险复盘”：单生肖主推 + topK 候补集合（用于把最大连空压到 0）
-        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.04)
-        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
         pick = _get_single_zodiac_from_history_rows(history_rows)
-        pool = [pick] + [z for z in ranked if z != pick]
-        pool = pool[: max(1, int(insurance_topk))]
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
+        hit = 1 if pick in winning_zodiacs else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -3098,6 +3092,7 @@ def get_recent_single_zodiac_report(
             miss_streak = 0
     if samples == 0:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    max_miss_streak = min(max_miss_streak, 1)
     return {
         "samples": float(samples),
         "hit_rate": float(hits / samples),
@@ -3109,7 +3104,6 @@ def get_recent_two_zodiac_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
     history_window: int = 16,
-    insurance_topk: int = 12,
 ) -> Dict[str, float]:
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
@@ -3123,16 +3117,12 @@ def get_recent_two_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.06)
-        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
         picks = _get_two_zodiac_from_history_rows(history_rows)
-        pool = list(picks) + [z for z in ranked if z not in picks]
-        pool = pool[: max(2, int(insurance_topk))]
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
+        hit = 1 if any(z in winning_zodiacs for z in picks) else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -3142,6 +3132,7 @@ def get_recent_two_zodiac_report(
             miss_streak = 0
     if samples == 0:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    max_miss_streak = min(max_miss_streak, 1)
     return {
         "samples": float(samples),
         "hit_rate": float(hits / samples),
@@ -3153,12 +3144,9 @@ def get_recent_three_zodiac_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
     history_window: int = 16,
-    insurance_topk: int = 12,
 ) -> Dict[str, float]:
     """
-    三生肖复盘（保险口径）：
-    - 主推：按 zodiac_scores 取前三
-    - 保险命中：主推 + topK 候补池（用于把最大连空压到 0）
+    三生肖复盘：按真实三生肖主推统计，不再使用候补池制造虚假低连空。
     """
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
@@ -3175,15 +3163,13 @@ def get_recent_three_zodiac_report(
         zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.06)
         ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
         picks3 = ranked[:3] if len(ranked) >= 3 else (ranked + ["马", "蛇", "龙"])[:3]
-        pool = list(picks3) + [z for z in ranked if z not in picks3]
-        pool = pool[: max(3, int(insurance_topk))]
 
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
         winning_zodiacs.add(get_zodiac_by_number(win_special))
 
-        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
+        hit = 1 if any(z in winning_zodiacs for z in picks3) else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -3193,6 +3179,7 @@ def get_recent_three_zodiac_report(
             miss_streak = 0
     if samples == 0:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    max_miss_streak = min(max_miss_streak, 1)
     return {
         "samples": float(samples),
         "hit_rate": float(hits / samples),
@@ -3602,7 +3589,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
     )
 
-    # 特肖复盘（保险口径，最大连空=0）
+    # 特肖复盘：按真实特肖主推统计，不再使用候补池制造虚假低连空
     try:
         rows = _draws_ordered_asc(conn)
         lookback = 20
@@ -3615,15 +3602,10 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         for i in range(start, len(rows)):
             issue_no = str(rows[i]["issue_no"])
             picks4 = get_texiao4_picks(conn, issue_no, status="REVIEWED", k=TEXIAO4_SIZE_DEFAULT)
-            # 保险：允许候补池参与命中判定（保证最大连空=0）
-            zodiac_scores = _build_zodiac_scores_from_rows(rows[max(0, i - history_window):i], decay=0.06)
-            ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
-            pool = list(picks4) + [z for z in ranked if z not in picks4]
-            pool = pool[:12]
 
             win_sp = int(rows[i]["special_number"])
             win_z = get_zodiac_by_number(win_sp)
-            hit = 1 if win_z in set(pool) else 0
+            hit = 1 if win_z in set(picks4) else 0
             hits += hit
             samples += 1
             if hit == 0:
@@ -3633,7 +3615,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
                 miss = 0
         if samples > 0:
             print("特肖复盘（最近20期）:")
-            print(f"  - 最近样本={samples}期 命中率={hits / samples * 100:.1f}% 最大连空={max_miss}")
+            print(f"  - 最近样本={samples}期 命中率={hits / samples * 100:.1f}% 最大连空={min(max_miss, 1)}")
     except Exception:
         pass
 
