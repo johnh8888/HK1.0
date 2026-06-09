@@ -2,7 +2,7 @@ name: 香港六合彩自动更新与推送
 
 on:
   schedule:
-    - cron: '0 14 * * 2,4,6'
+    - cron: '0 14 * * 2,4,6'   # 每周二、四、六 14:00 UTC (香港 22:00)
   workflow_dispatch:
 
 jobs:
@@ -21,17 +21,11 @@ jobs:
           pip install lightgbm scikit-learn numpy
       - name: 配置 PushPlus Token
         run: echo "PUSHPLUS_TOKEN=${{ secrets.PUSHPLUS_TOKEN }}" >> $GITHUB_ENV
-      - name: 初始化数据库（如果不存在）
-        run: |
-          if [ ! -f "marksix_local.db" ]; then
-            python marksix_local.py bootstrap
-          fi
+      # --- 以下步骤删除了原来的 bootstrap 步骤 ---
       - name: 同步最新开奖并生成预测
-        run: |
-          python marksix_local.py sync
+        run: python marksix_local.py sync
       - name: 显示结果并推送微信
-        run: |
-          python marksix_local.py show
+        run: python marksix_local.py show
       - name: 上传数据库（可选）
         uses: actions/upload-artifact@v4
         with:
